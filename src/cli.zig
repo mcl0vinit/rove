@@ -30,6 +30,17 @@ pub const SyncCommand = struct {
     delete: bool = false,
 };
 
+pub const RefreshCommand = struct {
+    machine_name: ?[]const u8 = null,
+    prune_missing: bool = false,
+};
+
+pub const AdoptCommand = struct {
+    target: []const u8,
+    machine_id: []const u8,
+    name: ?[]const u8 = null,
+};
+
 pub const PullCommand = struct {
     machine_name: []const u8,
     preview: bool = false,
@@ -45,6 +56,8 @@ pub const WorkspaceTargetCommand = struct {
 pub const Command = union(enum) {
     help,
     status,
+    refresh: RefreshCommand,
+    adopt: AdoptCommand,
     run: RunCommand,
     sync: SyncCommand,
     pull: PullCommand,
@@ -72,6 +85,8 @@ pub fn run(
     switch (command) {
         .help => try printHelp(stdout),
         .status => try handleStatus(allocator, stdout, stderr),
+        .refresh => |refresh_command| try handleRefresh(allocator, stdout, stderr, refresh_command),
+        .adopt => |adopt_command| try handleAdopt(allocator, stdout, stderr, adopt_command),
         .run => |target| try handleRun(allocator, stdout, stderr, target),
         .sync => |target| try handleSync(allocator, stdout, stderr, target),
         .pull => |pull_command| try handlePull(allocator, stdout, stderr, pull_command),
@@ -92,6 +107,14 @@ pub fn parse(args: []const []const u8) ParseError!Command {
 
     if (std.mem.eql(u8, args[0], "run")) {
         return .{ .run = try parseRunCommand(args) };
+    }
+
+    if (std.mem.eql(u8, args[0], "refresh")) {
+        return .{ .refresh = try parseRefreshCommand(args) };
+    }
+
+    if (std.mem.eql(u8, args[0], "adopt")) {
+        return .{ .adopt = try parseAdoptCommand(args) };
     }
 
     if (std.mem.eql(u8, args[0], "sync")) {
@@ -142,6 +165,53 @@ fn parseRunCommand(args: []const []const u8) ParseError!RunCommand {
     };
 
     var index: usize = 2;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--name")) {
+            if (command.name != null) return error.InvalidArguments;
+            if (index + 1 >= args.len) return error.InvalidArguments;
+            if (args[index + 1].len == 0) return error.InvalidArguments;
+            command.name = args[index + 1];
+            index += 2;
+            continue;
+        }
+
+        return error.InvalidArguments;
+    }
+
+    return command;
+}
+
+fn parseRefreshCommand(args: []const []const u8) ParseError!RefreshCommand {
+    var command = RefreshCommand{};
+
+    var index: usize = 1;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--prune-missing")) {
+            if (command.prune_missing) return error.InvalidArguments;
+            command.prune_missing = true;
+            index += 1;
+            continue;
+        }
+
+        if (command.machine_name != null) return error.InvalidArguments;
+        if (args[index].len == 0) return error.InvalidArguments;
+        command.machine_name = args[index];
+        index += 1;
+    }
+
+    return command;
+}
+
+fn parseAdoptCommand(args: []const []const u8) ParseError!AdoptCommand {
+    if (args.len < 3) return error.InvalidArguments;
+    if (args[1].len == 0 or args[2].len == 0) return error.InvalidArguments;
+
+    var command = AdoptCommand{
+        .target = args[1],
+        .machine_id = args[2],
+    };
+
+    var index: usize = 3;
     while (index < args.len) {
         if (std.mem.eql(u8, args[index], "--name")) {
             if (command.name != null) return error.InvalidArguments;
@@ -257,13 +327,15 @@ pub fn printHelp(writer: anytype) !void {
         \\rove
         \\
         \\Usage:
+        \\  rove refresh [name] [--prune-missing]
+        \\  rove adopt <target> <machine-id> [--name <name>]
         \\  rove run <target> [--name <name>]
         \\  rove sync <name> [--preview] [--delete]
-        \\  rove pull <name> [--workspace <label-or-path>] [--preview] [--force]
+        \\  rove pull <name> [--workspace <selector>] [--preview] [--force]
         \\  rove workspaces <name>
-        \\  rove offload <name> [--workspace <label-or-path>]
+        \\  rove offload <name> [--workspace <selector>]
         \\  rove status
-        \\  rove ssh <name> [--workspace <label-or-path>]
+        \\  rove ssh <name> [--workspace <selector>]
         \\  rove down <name>
         \\
         \\This scaffold matches the handoff's first milestone:
@@ -285,11 +357,13 @@ pub fn printHelp(writer: anytype) !void {
         \\  `run` takes a target from rove.json
         \\  `--name` chooses the tracked instance name
         \\  if omitted, the target name is used
+        \\  `refresh` updates local state from the provider for one machine or all machines
+        \\  `refresh --prune-missing` removes tracked machines that no longer exist remotely
+        \\  `adopt` imports an existing provider machine into local state
         \\  `sync`, `pull`, `workspaces`, `offload`, `ssh`, and `down` address the tracked instance name
         \\  `sync --preview` shows rsync changes to the remote workspace without writing files
         \\  `sync --delete` removes remote files that no longer exist locally
-        \\  `pull --workspace` selects one tracked workspace by label, local path, or remote path
-        \\  `ssh --workspace` and `offload --workspace` reuse a specific tracked workspace
+        \\  `pull --workspace`, `ssh --workspace`, and `offload --workspace` accept `active`, an index from `workspaces`, a label, a local path, or a remote path
         \\  `pull --preview` shows rsync changes without writing local files
         \\  `pull` refuses to overwrite a dirty local git repo unless `--force` is set
         \\  `.roveignore` adds repo-local rsync exclusion rules for sync and offload
@@ -381,6 +455,174 @@ fn handleStatus(
             );
         }
     }
+}
+
+fn handleRefresh(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    stderr: anytype,
+    command: RefreshCommand,
+) !void {
+    var loaded_state = try state.loadOrEmpty(allocator, null);
+    defer loaded_state.deinit();
+
+    if (loaded_state.value.machines.len == 0) {
+        try stdout.writeAll(
+            "[info] no tracked machines\n" ++
+                "[hint] use `rove run <target>` or `rove adopt <target> <machine-id>` first\n",
+        );
+        return;
+    }
+
+    try stdout.writeAll("NAME\tRESULT\tSTATUS\tREMOTE\tHOST\n");
+
+    if (command.machine_name) |machine_name| {
+        const machine = state.findMachine(&loaded_state.value, machine_name) orelse {
+            try std.fmt.format(
+                stderr,
+                "[error] no tracked machine named '{s}'\n" ++
+                    "[hint] use `rove status` to inspect tracked machines\n",
+                .{machine_name},
+            );
+            return error.HandledFailure;
+        };
+
+        try refreshAndReportMachine(allocator, stdout, stderr, machine.*, command.prune_missing);
+        return;
+    }
+
+    var had_failures = false;
+    for (loaded_state.value.machines) |machine| {
+        refreshAndReportMachine(allocator, stdout, stderr, machine, command.prune_missing) catch |err| switch (err) {
+            error.HandledFailure => had_failures = true,
+            else => return err,
+        };
+    }
+
+    if (had_failures) {
+        try stderr.writeAll("[warn] some tracked machines could not be refreshed cleanly\n");
+    }
+}
+
+fn handleAdopt(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    stderr: anytype,
+    command: AdoptCommand,
+) !void {
+    var loaded_state = try state.loadOrEmpty(allocator, null);
+    defer loaded_state.deinit();
+
+    var loaded_config = config.load(allocator, null) catch |err| switch (err) {
+        error.FileNotFound => {
+            try std.fmt.format(
+                stderr,
+                "[error] missing config file '{s}'\n" ++
+                    "[hint] create it before adopting a target\n",
+                .{paths.defaultConfigPath()},
+            );
+            return error.HandledFailure;
+        },
+        else => return err,
+    };
+    defer loaded_config.deinit();
+
+    const target = config.resolveTarget(&loaded_config.value, command.target) catch |err| switch (err) {
+        error.TargetNotFound => {
+            try std.fmt.format(
+                stderr,
+                "[error] unknown target '{s}'\n" ++
+                    "[hint] add it to {s}\n",
+                .{ command.target, paths.defaultConfigPath() },
+            );
+            return error.HandledFailure;
+        },
+        else => return err,
+    };
+
+    if (state.findMachineById(&loaded_state.value, command.machine_id)) |existing| {
+        try std.fmt.format(
+            stderr,
+            "[error] machine '{s}' is already tracked as '{s}'\n" ++
+                "[hint] use `rove refresh {s}` or `rove status` to inspect it\n",
+            .{ command.machine_id, existing.name, existing.name },
+        );
+        return error.HandledFailure;
+    }
+
+    const inspected = try provider.inspect(allocator, target.provider, .{
+        .app = target.app,
+        .machine_id = command.machine_id,
+    });
+    defer inspected.deinit(allocator);
+
+    if (!inspected.exists) {
+        try std.fmt.format(
+            stderr,
+            "[error] machine '{s}' was not found in app '{s}'\n",
+            .{ command.machine_id, target.app },
+        );
+        return error.HandledFailure;
+    }
+
+    const adopted_name = command.name orelse inspected.machine_name orelse command.machine_id;
+    if (!isValidInstanceName(adopted_name)) {
+        try std.fmt.format(
+            stderr,
+            "[error] invalid adopted instance name '{s}'\n" ++
+                "[hint] pass `--name` with letters, digits, '-', '_' or '.' only\n",
+            .{adopted_name},
+        );
+        return error.HandledFailure;
+    }
+
+    if (state.findMachine(&loaded_state.value, adopted_name) != null) {
+        try std.fmt.format(
+            stderr,
+            "[error] instance '{s}' already exists in local state\n" ++
+                "[hint] choose a different `--name` or remove the existing entry first\n",
+            .{adopted_name},
+        );
+        return error.HandledFailure;
+    }
+
+    const fallback_host = try std.fmt.allocPrint(allocator, "{s}.fly.dev", .{target.app});
+    defer allocator.free(fallback_host);
+
+    const machine = model.MachineRecord{
+        .name = adopted_name,
+        .target_name = target.name,
+        .provider = target.provider,
+        .id = command.machine_id,
+        .machine_name = inspected.machine_name,
+        .app = target.app,
+        .host = inspected.host orelse fallback_host,
+        .region = inspected.region,
+        .remote_state = inspected.remote_state,
+        .ssh_user = target.ssh_user,
+        .status = lifecycleFromRemoteState(inspected.remote_state, .provisioned),
+    };
+
+    try state.upsertMachine(allocator, machine, null);
+
+    try std.fmt.format(
+        stdout,
+        "[info] adopted machine '{s}' as instance '{s}'\n" ++
+            "[info] target: {s}\n" ++
+            "[info] provider: {s}\n" ++
+            "[info] app: {s}\n" ++
+            "[info] host: {s}\n" ++
+            "[info] remote_state: {s}\n",
+        .{
+            command.machine_id,
+            adopted_name,
+            target.name,
+            model.providerName(target.provider),
+            target.app,
+            machine.host,
+            machine.remote_state orelse "unknown",
+        },
+    );
 }
 
 fn handleRun(
@@ -697,19 +939,26 @@ fn handleWorkspaces(
     }
 
     const active = workspace.activeTracked(machine.*);
-    try stdout.writeAll("ACTIVE\tNAME\tLOCAL\tREMOTE\tTMUX\n");
+    try stdout.writeAll("INDEX\tACTIVE\tNAME\tLOCAL\tREMOTE\tTMUX\n");
 
     if (machine.workspaces.len > 0) {
-        for (machine.workspaces) |tracked| {
-            try printWorkspaceRow(stdout, tracked, active);
+        for (machine.workspaces, 0..) |tracked, index| {
+            try printWorkspaceRow(stdout, index + 1, tracked, active);
         }
     } else if (machine.workspace) |tracked| {
-        try printWorkspaceRow(stdout, tracked, active);
+        try printWorkspaceRow(stdout, 1, tracked, active);
     }
+
+    try std.fmt.format(
+        stdout,
+        "[hint] use `--workspace active`, `--workspace <index>`, a label, a local path, or a remote path with `rove pull {s}`, `rove ssh {s}`, or `rove offload {s}`\n",
+        .{ machine_name, machine_name, machine_name },
+    );
 }
 
 fn printWorkspaceRow(
     stdout: anytype,
+    index: usize,
     tracked: model.WorkspaceRecord,
     active: ?model.WorkspaceRecord,
 ) !void {
@@ -721,8 +970,9 @@ fn printWorkspaceRow(
 
     try std.fmt.format(
         stdout,
-        "{s}\t{s}\t{s}\t{s}\t{s}\n",
+        "{d}\t{s}\t{s}\t{s}\t{s}\t{s}\n",
         .{
+            index,
             if (is_active) "*" else "-",
             workspace.recordName(tracked),
             tracked.local_path,
@@ -868,7 +1118,7 @@ fn handlePull(
             try std.fmt.format(
                 stderr,
                 "[error] machine '{s}' has no tracked workspace matching '{s}'\n" ++
-                    "[hint] use the workspace label, local path, or remote path from `rove workspaces {s}`\n",
+                    "[hint] use `active`, an index, a label, a local path, or a remote path from `rove workspaces {s}`\n",
                 .{ command.machine_name, command.workspace_selector.?, command.machine_name },
             );
             return error.HandledFailure;
@@ -1127,6 +1377,7 @@ fn renderPlacementSummary(
 
 const RefreshedMachine = struct {
     value: model.MachineRecord,
+    missing: bool = false,
     owned_machine_name: ?[]const u8 = null,
     owned_host: ?[]const u8 = null,
     owned_region: ?[]const u8 = null,
@@ -1160,6 +1411,8 @@ fn refreshMachineFromProvider(
 
     if (!inspected.exists) {
         refreshed.value.remote_state = "missing";
+        refreshed.value.status = lifecycleFromRemoteState(refreshed.value.remote_state, refreshed.value.status);
+        refreshed.missing = true;
         return refreshed;
     }
 
@@ -1182,8 +1435,80 @@ fn refreshMachineFromProvider(
     } else {
         refreshed.value.remote_state = "unknown";
     }
+    refreshed.value.status = lifecycleFromRemoteState(refreshed.value.remote_state, refreshed.value.status);
 
     return refreshed;
+}
+
+fn refreshAndReportMachine(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    stderr: anytype,
+    machine: model.MachineRecord,
+    prune_missing: bool,
+) !void {
+    var refreshed = refreshMachineFromProvider(allocator, machine) catch |err| {
+        try std.fmt.format(
+            stderr,
+            "[warn] failed to refresh machine '{s}': {s}\n",
+            .{ machine.name, @errorName(err) },
+        );
+        return error.HandledFailure;
+    };
+    defer refreshed.deinit(allocator);
+
+    if (prune_missing and refreshed.missing) {
+        _ = try state.removeMachine(allocator, machine.name, null);
+        try std.fmt.format(
+            stdout,
+            "{s}\tpruned\t{s}\tmissing\t-\n",
+            .{ machine.name, model.statusName(refreshed.value.status) },
+        );
+        return;
+    }
+
+    try state.upsertMachine(allocator, refreshed.value, null);
+
+    try std.fmt.format(
+        stdout,
+        "{s}\t{s}\t{s}\t{s}\t{s}\n",
+        .{
+            machine.name,
+            if (refreshed.missing) "missing" else "updated",
+            model.statusName(refreshed.value.status),
+            refreshed.value.remote_state orelse "-",
+            refreshed.value.host,
+        },
+    );
+}
+
+fn lifecycleFromRemoteState(
+    remote_state: ?[]const u8,
+    fallback: model.LifecycleStatus,
+) model.LifecycleStatus {
+    const value = remote_state orelse return fallback;
+
+    if (std.ascii.eqlIgnoreCase(value, "started") or std.ascii.eqlIgnoreCase(value, "running")) {
+        return .ready;
+    }
+
+    if (std.ascii.eqlIgnoreCase(value, "created") or
+        std.ascii.eqlIgnoreCase(value, "starting") or
+        std.ascii.eqlIgnoreCase(value, "pending"))
+    {
+        return .provisioned;
+    }
+
+    if (std.ascii.eqlIgnoreCase(value, "stopped") or
+        std.ascii.eqlIgnoreCase(value, "suspended") or
+        std.ascii.eqlIgnoreCase(value, "failed") or
+        std.ascii.eqlIgnoreCase(value, "destroyed") or
+        std.ascii.eqlIgnoreCase(value, "missing"))
+    {
+        return .provisioned_unreachable;
+    }
+
+    return fallback;
 }
 
 fn resolveTrackedWorkspaceRecord(
@@ -1197,7 +1522,7 @@ fn resolveTrackedWorkspaceRecord(
             try std.fmt.format(
                 stderr,
                 "[error] machine '{s}' has no tracked workspace matching '{s}'\n" ++
-                    "[hint] use the workspace label, local path, or remote path from `rove workspaces {s}`\n",
+                    "[hint] use `active`, an index, a label, a local path, or a remote path from `rove workspaces {s}`\n",
                 .{ machine_name, selector, machine_name },
             );
             return error.HandledFailure;
@@ -1407,6 +1732,43 @@ test "parse status" {
 
     switch (command) {
         .status => {},
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse refresh all with prune" {
+    const command = try parse(&.{ "refresh", "--prune-missing" });
+
+    switch (command) {
+        .refresh => |refresh_command| {
+            try std.testing.expect(refresh_command.machine_name == null);
+            try std.testing.expect(refresh_command.prune_missing);
+        },
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse refresh target" {
+    const command = try parse(&.{ "refresh", "sam-east" });
+
+    switch (command) {
+        .refresh => |refresh_command| {
+            try std.testing.expectEqualStrings("sam-east", refresh_command.machine_name.?);
+            try std.testing.expect(!refresh_command.prune_missing);
+        },
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse adopt target" {
+    const command = try parse(&.{ "adopt", "devbox", "machine-123", "--name", "sam-east" });
+
+    switch (command) {
+        .adopt => |adopt_command| {
+            try std.testing.expectEqualStrings("devbox", adopt_command.target);
+            try std.testing.expectEqualStrings("machine-123", adopt_command.machine_id);
+            try std.testing.expectEqualStrings("sam-east", adopt_command.name.?);
+        },
         else => return error.InvalidArguments,
     }
 }

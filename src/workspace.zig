@@ -94,6 +94,14 @@ pub fn resolveTrackedSelector(
     machine: model.MachineRecord,
     selector: []const u8,
 ) Error!model.WorkspaceRecord {
+    if (std.mem.eql(u8, selector, "active")) {
+        return activeTracked(machine) orelse error.NoTrackedWorkspace;
+    }
+
+    if (parseSelectorIndex(selector)) |index| {
+        return trackedByIndex(machine, index) orelse error.WorkspaceNotFound;
+    }
+
     var found: ?model.WorkspaceRecord = null;
 
     if (machine.workspaces.len > 0) {
@@ -396,6 +404,33 @@ fn matchesSelector(
         std.mem.eql(u8, record.remote_path, selector);
 }
 
+fn parseSelectorIndex(selector: []const u8) ?usize {
+    if (selector.len == 0) return null;
+
+    const raw = if (selector[0] == '#') selector[1..] else selector;
+    if (raw.len == 0) return null;
+
+    return std.fmt.parseUnsigned(usize, raw, 10) catch null;
+}
+
+fn trackedByIndex(
+    machine: model.MachineRecord,
+    index: usize,
+) ?model.WorkspaceRecord {
+    if (index == 0) return null;
+
+    if (machine.workspaces.len > 0) {
+        if (index > machine.workspaces.len) return null;
+        return machine.workspaces[index - 1];
+    }
+
+    if (index == 1) {
+        return machine.workspace;
+    }
+
+    return null;
+}
+
 fn detectRepoRoot(
     allocator: std.mem.Allocator,
     current_dir: []const u8,
@@ -597,6 +632,56 @@ test "resolve tracked selector by local path" {
     }, "/tmp/project");
 
     try std.testing.expectEqualStrings("/tmp/project", record.local_path);
+}
+
+test "resolve tracked selector by index" {
+    const record = try resolveTrackedSelector(.{
+        .name = "devbox",
+        .provider = .fly,
+        .id = "machine-1",
+        .host = "devbox.fly.dev",
+        .ssh_user = "rove",
+        .workspaces = &.{
+            .{
+                .name = "one",
+                .local_path = "/tmp/one",
+                .remote_path = "$HOME/work/one",
+            },
+            .{
+                .name = "two",
+                .local_path = "/tmp/two",
+                .remote_path = "$HOME/work/two",
+            },
+        },
+        .status = .ready,
+    }, "2");
+
+    try std.testing.expectEqualStrings("/tmp/two", record.local_path);
+}
+
+test "resolve tracked selector by active alias" {
+    const record = try resolveTrackedSelector(.{
+        .name = "devbox",
+        .provider = .fly,
+        .id = "machine-1",
+        .host = "devbox.fly.dev",
+        .ssh_user = "rove",
+        .workspace = .{
+            .name = "active",
+            .local_path = "/tmp/active",
+            .remote_path = "$HOME/work/active",
+        },
+        .workspaces = &.{
+            .{
+                .name = "other",
+                .local_path = "/tmp/other",
+                .remote_path = "$HOME/work/other",
+            },
+        },
+        .status = .ready,
+    }, "active");
+
+    try std.testing.expectEqualStrings("/tmp/active", record.local_path);
 }
 
 test "resolve tracked selector rejects ambiguous labels" {

@@ -55,6 +55,19 @@ pub fn findMachine(
     return null;
 }
 
+pub fn findMachineById(
+    file: *const model.StateFile,
+    id: []const u8,
+) ?*const model.MachineRecord {
+    for (file.machines) |*machine| {
+        if (std.mem.eql(u8, machine.id, id)) {
+            return machine;
+        }
+    }
+
+    return null;
+}
+
 pub fn save(
     allocator: std.mem.Allocator,
     file: model.StateFile,
