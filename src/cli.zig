@@ -24,6 +24,12 @@ pub const RunCommand = struct {
     name: ?[]const u8 = null,
 };
 
+pub const SyncCommand = struct {
+    machine_name: []const u8,
+    preview: bool = false,
+    delete: bool = false,
+};
+
 pub const PullCommand = struct {
     machine_name: []const u8,
     preview: bool = false,
@@ -40,7 +46,7 @@ pub const Command = union(enum) {
     help,
     status,
     run: RunCommand,
-    sync: []const u8,
+    sync: SyncCommand,
     pull: PullCommand,
     workspaces: []const u8,
     offload: WorkspaceTargetCommand,
@@ -89,7 +95,7 @@ pub fn parse(args: []const []const u8) ParseError!Command {
     }
 
     if (std.mem.eql(u8, args[0], "sync")) {
-        return .{ .sync = try expectSingleTarget(args) };
+        return .{ .sync = try parseSyncCommand(args) };
     }
 
     if (std.mem.eql(u8, args[0], "pull")) {
@@ -191,6 +197,36 @@ fn parsePullCommand(args: []const []const u8) ParseError!PullCommand {
     return command;
 }
 
+fn parseSyncCommand(args: []const []const u8) ParseError!SyncCommand {
+    if (args.len < 2) return error.InvalidArguments;
+    if (args[1].len == 0) return error.InvalidArguments;
+
+    var command = SyncCommand{
+        .machine_name = args[1],
+    };
+
+    var index: usize = 2;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--preview")) {
+            if (command.preview) return error.InvalidArguments;
+            command.preview = true;
+            index += 1;
+            continue;
+        }
+
+        if (std.mem.eql(u8, args[index], "--delete")) {
+            if (command.delete) return error.InvalidArguments;
+            command.delete = true;
+            index += 1;
+            continue;
+        }
+
+        return error.InvalidArguments;
+    }
+
+    return command;
+}
+
 fn parseWorkspaceTargetCommand(args: []const []const u8) ParseError!WorkspaceTargetCommand {
     if (args.len < 2) return error.InvalidArguments;
     if (args[1].len == 0) return error.InvalidArguments;
@@ -222,7 +258,7 @@ pub fn printHelp(writer: anytype) !void {
         \\
         \\Usage:
         \\  rove run <target> [--name <name>]
-        \\  rove sync <name>
+        \\  rove sync <name> [--preview] [--delete]
         \\  rove pull <name> [--workspace <label-or-path>] [--preview] [--force]
         \\  rove workspaces <name>
         \\  rove offload <name> [--workspace <label-or-path>]
@@ -250,10 +286,13 @@ pub fn printHelp(writer: anytype) !void {
         \\  `--name` chooses the tracked instance name
         \\  if omitted, the target name is used
         \\  `sync`, `pull`, `workspaces`, `offload`, `ssh`, and `down` address the tracked instance name
+        \\  `sync --preview` shows rsync changes to the remote workspace without writing files
+        \\  `sync --delete` removes remote files that no longer exist locally
         \\  `pull --workspace` selects one tracked workspace by label, local path, or remote path
         \\  `ssh --workspace` and `offload --workspace` reuse a specific tracked workspace
         \\  `pull --preview` shows rsync changes without writing local files
         \\  `pull` refuses to overwrite a dirty local git repo unless `--force` is set
+        \\  `.roveignore` adds repo-local rsync exclusion rules for sync and offload
         \\
     );
 }
@@ -581,17 +620,34 @@ fn handleSsh(
         return error.HandledFailure;
     }
 
-    const term = if (command.workspace_selector) |selector|
-        try openWorkspaceSsh(allocator, stderr, machine.*, command.machine_name, selector)
-    else
-        ssh.openInteractive(allocator, machine.*) catch |err| {
-            try std.fmt.format(
+    const term = term: {
+        if (command.workspace_selector) |selector| {
+            break :term try openWorkspaceSsh(allocator, stderr, machine.*, command.machine_name, selector);
+        }
+
+        if (workspace.activeTracked(machine.*)) |tracked| {
+            break :term openTrackedWorkspaceSsh(
+                allocator,
                 stderr,
-                "[error] failed to start ssh for machine '{s}': {s}\n",
-                .{ command.machine_name, @errorName(err) },
-            );
-            return error.HandledFailure;
-        };
+                machine.*,
+                command.machine_name,
+                tracked,
+                workspace.recordName(tracked),
+            ) catch |err| switch (err) {
+                error.HandledFailure => {
+                    try std.fmt.format(
+                        stderr,
+                        "[warn] failed to attach the active workspace for '{s}'; falling back to a raw shell\n",
+                        .{command.machine_name},
+                    );
+                    break :term try openRawSsh(allocator, stderr, machine.*, command.machine_name);
+                },
+                else => return err,
+            };
+        }
+
+        break :term try openRawSsh(allocator, stderr, machine.*, command.machine_name);
+    };
 
     switch (term) {
         .Exited => |code| {
@@ -680,17 +736,17 @@ fn handleSync(
     allocator: std.mem.Allocator,
     stdout: anytype,
     stderr: anytype,
-    machine_name: []const u8,
+    command: SyncCommand,
 ) !void {
     var loaded_state = try state.loadOrEmpty(allocator, null);
     defer loaded_state.deinit();
 
-    const machine_ptr = state.findMachine(&loaded_state.value, machine_name) orelse {
+    const machine_ptr = state.findMachine(&loaded_state.value, command.machine_name) orelse {
         try std.fmt.format(
             stderr,
             "[error] no tracked machine named '{s}'\n" ++
                 "[hint] run a target first so there is a machine to sync into\n",
-            .{machine_name},
+            .{command.machine_name},
         );
         return error.HandledFailure;
     };
@@ -699,7 +755,7 @@ fn handleSync(
         try std.fmt.format(
             stderr,
             "[error] machine '{s}' is being destroyed\n",
-            .{machine_name},
+            .{command.machine_name},
         );
         return error.HandledFailure;
     }
@@ -708,20 +764,56 @@ fn handleSync(
     const resolved = try workspace.discover(allocator, machine);
     defer resolved.deinit(allocator);
 
+    if (command.preview) {
+        var preview = sync.previewSyncWorkspace(allocator, machine, resolved, .{
+            .delete = command.delete,
+        }) catch |err| {
+            try std.fmt.format(
+                stderr,
+                "[error] workspace sync preview failed for machine '{s}': {s}\n",
+                .{ command.machine_name, @errorName(err) },
+            );
+            return error.HandledFailure;
+        };
+        defer preview.deinit(allocator);
+
+        try std.fmt.format(
+            stdout,
+            "[info] previewing sync from '{s}' to {s}\n",
+            .{ resolved.local_root, resolved.remote_root },
+        );
+        if (command.delete) {
+            try stdout.writeAll("[info] preview includes remote deletions because --delete was set\n");
+        }
+
+        if (preview.hasChanges()) {
+            try stdout.writeAll(preview.changes);
+        } else {
+            try stdout.writeAll("[info] no local changes detected\n");
+        }
+        return;
+    }
+
     try std.fmt.format(
         stdout,
         "[info] syncing workspace '{s}' to {s}\n",
         .{ resolved.local_root, resolved.remote_root },
     );
+    if (command.delete) {
+        try stdout.writeAll("[info] deleting remote files missing from the local workspace because --delete was set\n");
+    }
 
     const ran_bootstrap_hook = try syncResolvedWorkspace(
         allocator,
         stderr,
         &machine,
-        machine_name,
+        command.machine_name,
         resolved,
         .syncing,
         .sync_failed,
+        .{
+            .delete = command.delete,
+        },
     );
 
     const tracked_workspaces = try workspace.mergeTracked(allocator, machine, workspace.buildRecord(resolved, null));
@@ -735,7 +827,7 @@ fn handleSync(
     try std.fmt.format(
         stdout,
         "[info] workspace synced for machine '{s}'\n",
-        .{machine_name},
+        .{command.machine_name},
     );
     if (ran_bootstrap_hook) {
         try stdout.writeAll("[info] ran repo-local bootstrap hook .rove/bootstrap.sh\n");
@@ -1131,6 +1223,17 @@ fn openWorkspaceSsh(
     selector: []const u8,
 ) !std.process.Child.Term {
     const tracked = try resolveTrackedWorkspaceRecord(stderr, machine, machine_name, selector);
+    return openTrackedWorkspaceSsh(allocator, stderr, machine, machine_name, tracked, selector);
+}
+
+fn openTrackedWorkspaceSsh(
+    allocator: std.mem.Allocator,
+    stderr: anytype,
+    machine: model.MachineRecord,
+    machine_name: []const u8,
+    tracked: model.WorkspaceRecord,
+    selector_label: []const u8,
+) !std.process.Child.Term {
     const resolved = try workspace.fromRecord(allocator, tracked);
     defer resolved.deinit(allocator);
 
@@ -1141,7 +1244,7 @@ fn openWorkspaceSsh(
         try std.fmt.format(
             stderr,
             "[error] failed to prepare tmux workspace '{s}' on machine '{s}': {s}\n",
-            .{ selector, machine_name, @errorName(err) },
+            .{ selector_label, machine_name, @errorName(err) },
         );
         return error.HandledFailure;
     };
@@ -1153,6 +1256,22 @@ fn openWorkspaceSsh(
         try std.fmt.format(
             stderr,
             "[error] failed to start workspace ssh for machine '{s}': {s}\n",
+            .{ machine_name, @errorName(err) },
+        );
+        return error.HandledFailure;
+    };
+}
+
+fn openRawSsh(
+    allocator: std.mem.Allocator,
+    stderr: anytype,
+    machine: model.MachineRecord,
+    machine_name: []const u8,
+) !std.process.Child.Term {
+    return ssh.openInteractive(allocator, machine) catch |err| {
+        try std.fmt.format(
+            stderr,
+            "[error] failed to start ssh for machine '{s}': {s}\n",
             .{ machine_name, @errorName(err) },
         );
         return error.HandledFailure;
@@ -1187,6 +1306,7 @@ fn performOffload(
         resolved,
         .offloading,
         .offload_failed,
+        .{},
     );
 
     tmux.applyRemote(allocator, machine.*, planned.restore) catch |err| {
@@ -1251,11 +1371,12 @@ fn syncResolvedWorkspace(
     resolved: workspace.ResolvedWorkspace,
     active_status: model.LifecycleStatus,
     failure_status: model.LifecycleStatus,
+    sync_options: sync.SyncOptions,
 ) !bool {
     machine.status = active_status;
     try state.upsertMachine(allocator, machine.*, null);
 
-    const result = sync.syncWorkspace(allocator, machine.*, resolved) catch |err| {
+    const result = sync.syncWorkspace(allocator, machine.*, resolved, sync_options) catch |err| {
         machine.status = failure_status;
         try state.upsertMachine(allocator, machine.*, null);
 
@@ -1318,7 +1439,24 @@ test "parse sync target" {
     const command = try parse(&.{ "sync", "sam-east" });
 
     switch (command) {
-        .sync => |name| try std.testing.expectEqualStrings("sam-east", name),
+        .sync => |sync_command| {
+            try std.testing.expectEqualStrings("sam-east", sync_command.machine_name);
+            try std.testing.expect(!sync_command.preview);
+            try std.testing.expect(!sync_command.delete);
+        },
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse sync target with preview and delete" {
+    const command = try parse(&.{ "sync", "sam-east", "--preview", "--delete" });
+
+    switch (command) {
+        .sync => |sync_command| {
+            try std.testing.expectEqualStrings("sam-east", sync_command.machine_name);
+            try std.testing.expect(sync_command.preview);
+            try std.testing.expect(sync_command.delete);
+        },
         else => return error.InvalidArguments,
     }
 }
