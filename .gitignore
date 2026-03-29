@@ -1,3 +1,4 @@
 .zig-cache/
 zig-out/
 result
+docs/rove_dev_handoff_package.zip
