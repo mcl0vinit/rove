@@ -2,6 +2,8 @@ const std = @import("std");
 const exec = @import("exec.zig");
 const model = @import("model.zig");
 
+pub const bootstrap_hook_path = ".rove/bootstrap.sh";
+
 pub const ResolvedWorkspace = struct {
     local_root: []u8,
     current_dir: []u8,
@@ -37,6 +39,30 @@ pub fn discover(
     else
         try std.fmt.allocPrint(allocator, "$HOME/work/{s}", .{name});
     errdefer allocator.free(remote_root);
+
+    return .{
+        .local_root = local_root,
+        .current_dir = current_dir,
+        .remote_root = remote_root,
+        .name = name,
+    };
+}
+
+pub fn fromRecord(
+    allocator: std.mem.Allocator,
+    existing: model.WorkspaceRecord,
+) !ResolvedWorkspace {
+    const local_root = try allocator.dupe(u8, existing.local_path);
+    errdefer allocator.free(local_root);
+
+    const current_dir = try allocator.dupe(u8, existing.local_path);
+    errdefer allocator.free(current_dir);
+
+    const remote_root = try allocator.dupe(u8, existing.remote_path);
+    errdefer allocator.free(remote_root);
+
+    const name = try workspaceName(allocator, existing.local_path);
+    errdefer allocator.free(name);
 
     return .{
         .local_root = local_root,
@@ -87,6 +113,24 @@ pub fn quoteRemotePath(
     try writer.writer.writeByte('"');
 
     return allocator.dupe(u8, writer.written());
+}
+
+pub fn localBootstrapHookPath(
+    allocator: std.mem.Allocator,
+    resolved: ResolvedWorkspace,
+) !?[]u8 {
+    const hook_path = try std.fs.path.join(allocator, &.{ resolved.local_root, bootstrap_hook_path });
+    errdefer allocator.free(hook_path);
+
+    std.fs.cwd().access(hook_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            allocator.free(hook_path);
+            return null;
+        },
+        else => return err,
+    };
+
+    return hook_path;
 }
 
 fn detectRepoRoot(
@@ -184,4 +228,46 @@ test "quote remote HOME path keeps expansion" {
     defer allocator.free(quoted);
 
     try std.testing.expectEqualStrings("\"$HOME/work/project/src\"", quoted);
+}
+
+test "rebuild workspace from saved record" {
+    const allocator = std.testing.allocator;
+    const resolved = try fromRecord(allocator, .{
+        .local_path = "/tmp/project",
+        .remote_path = "$HOME/work/project",
+    });
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqualStrings("/tmp/project", resolved.local_root);
+    try std.testing.expectEqualStrings("/tmp/project", resolved.current_dir);
+    try std.testing.expectEqualStrings("$HOME/work/project", resolved.remote_root);
+    try std.testing.expectEqualStrings("project", resolved.name);
+}
+
+test "detect repo-local bootstrap hook" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath(".rove");
+    try tmp.dir.writeFile(.{
+        .sub_path = ".rove/bootstrap.sh",
+        .data = "#!/usr/bin/env bash\n",
+    });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const resolved = ResolvedWorkspace{
+        .local_root = try allocator.dupe(u8, tmp_path),
+        .current_dir = try allocator.dupe(u8, tmp_path),
+        .remote_root = try allocator.dupe(u8, "$HOME/work/project"),
+        .name = try allocator.dupe(u8, "project"),
+    };
+    defer resolved.deinit(allocator);
+
+    const hook_path = (try localBootstrapHookPath(allocator, resolved)).?;
+    defer allocator.free(hook_path);
+
+    try std.testing.expect(std.mem.endsWith(u8, hook_path, ".rove/bootstrap.sh"));
 }

@@ -15,15 +15,127 @@ const default_excludes = [_][]const u8{
     "dist/",
 };
 
-pub fn pushWorkspace(
+pub const SyncResult = struct {
+    ran_bootstrap_hook: bool = false,
+};
+
+pub fn syncWorkspace(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    resolved: workspace.ResolvedWorkspace,
+) !SyncResult {
+    try pushWorkspaceFiles(allocator, machine, resolved);
+    return .{
+        .ran_bootstrap_hook = try runRemoteBootstrapHook(allocator, machine, resolved),
+    };
+}
+
+pub fn pushWorkspaceFiles(
     allocator: std.mem.Allocator,
     machine: model.MachineRecord,
     resolved: workspace.ResolvedWorkspace,
 ) !void {
-    const remote_dir = try workspace.quoteRemotePath(allocator, resolved.remote_root);
-    defer allocator.free(remote_dir);
+    try ensureRemoteWorkspaceRoot(allocator, machine, resolved.remote_root);
 
-    const mkdir_command = try std.fmt.allocPrint(allocator, "mkdir -p {s}", .{remote_dir});
+    const source = try std.fmt.allocPrint(allocator, "{s}/", .{resolved.local_root});
+    defer allocator.free(source);
+
+    const remote_path = try workspace.quoteRemotePath(allocator, resolved.remote_root);
+    defer allocator.free(remote_path);
+
+    const destination = try std.fmt.allocPrint(
+        allocator,
+        "{s}@{s}:{s}/",
+        .{ machine.ssh_user, machine.host, remote_path },
+    );
+    defer allocator.free(destination);
+
+    try runRsync(allocator, machine, source, destination);
+}
+
+pub fn pullWorkspaceFiles(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    resolved: workspace.ResolvedWorkspace,
+) !void {
+    try ensureLocalWorkspaceRoot(resolved.local_root);
+
+    const remote_path = try workspace.quoteRemotePath(allocator, resolved.remote_root);
+    defer allocator.free(remote_path);
+
+    const source = try std.fmt.allocPrint(
+        allocator,
+        "{s}@{s}:{s}/",
+        .{ machine.ssh_user, machine.host, remote_path },
+    );
+    defer allocator.free(source);
+
+    const destination = try std.fmt.allocPrint(allocator, "{s}/", .{resolved.local_root});
+    defer allocator.free(destination);
+
+    try runRsync(allocator, machine, source, destination);
+}
+
+pub fn runRemoteBootstrapHook(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    resolved: workspace.ResolvedWorkspace,
+) !bool {
+    const local_hook_path = try workspace.localBootstrapHookPath(allocator, resolved);
+    defer if (local_hook_path) |path| allocator.free(path);
+
+    if (local_hook_path == null) {
+        return false;
+    }
+
+    const remote_root = try workspace.quoteRemotePath(allocator, resolved.remote_root);
+    defer allocator.free(remote_root);
+
+    const remote_command = try std.fmt.allocPrint(
+        allocator,
+        \\cd {s}
+        \\if [[ ! -f ./{s} ]]; then
+        \\  echo "missing workspace bootstrap hook" >&2
+        \\  exit 1
+        \\fi
+        \\chmod 700 ./{s}
+        \\bash ./{s}
+        \\
+    ,
+        .{
+            remote_root,
+            workspace.bootstrap_hook_path,
+            workspace.bootstrap_hook_path,
+            workspace.bootstrap_hook_path,
+        },
+    );
+    defer allocator.free(remote_command);
+
+    const result = try ssh.runBatchCommand(allocator, machine, remote_command);
+    defer result.deinit(allocator);
+
+    if (!result.succeeded()) {
+        if (result.stdout.len > 0) {
+            std.debug.print("[error] workspace bootstrap stdout\n{s}", .{result.stdout});
+        }
+        if (result.stderr.len > 0) {
+            std.debug.print("[error] workspace bootstrap stderr\n{s}", .{result.stderr});
+        }
+        return error.CommandFailed;
+    }
+
+    return true;
+}
+
+fn ensureRemoteWorkspaceRoot(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    remote_root: []const u8,
+) !void {
+    const quoted_remote_root = try workspace.quoteRemotePath(allocator, remote_root);
+    defer allocator.free(quoted_remote_root);
+
+    const mkdir_command = try std.fmt.allocPrint(allocator, "mkdir -p {s}", .{quoted_remote_root});
     defer allocator.free(mkdir_command);
 
     const mkdir_result = try ssh.runBatchCommand(allocator, machine, mkdir_command);
@@ -35,22 +147,27 @@ pub fn pushWorkspace(
         }
         return error.CommandFailed;
     }
+}
 
+fn ensureLocalWorkspaceRoot(local_root: []const u8) !void {
+    if (std.fs.path.isAbsolute(local_root)) {
+        var root = try std.fs.openDirAbsolute("/", .{});
+        defer root.close();
+        try root.makePath(std.mem.trimLeft(u8, local_root, "/"));
+        return;
+    }
+
+    try std.fs.cwd().makePath(local_root);
+}
+
+fn runRsync(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    source: []const u8,
+    destination: []const u8,
+) !void {
     const transport = try ssh.rsyncTransportCommand(allocator, machine);
     defer allocator.free(transport);
-
-    const source = try std.fmt.allocPrint(allocator, "{s}/", .{resolved.local_root});
-    defer allocator.free(source);
-
-    const destination_path = try workspace.quoteRemotePath(allocator, resolved.remote_root);
-    defer allocator.free(destination_path);
-
-    const destination = try std.fmt.allocPrint(
-        allocator,
-        "{s}@{s}:{s}/",
-        .{ machine.ssh_user, machine.host, destination_path },
-    );
-    defer allocator.free(destination);
 
     var args = std.ArrayListUnmanaged([]const u8){};
     defer args.deinit(allocator);
@@ -66,7 +183,7 @@ pub fn pushWorkspace(
 
     if (!result.succeeded()) {
         if (result.stderr.len > 0) {
-            std.debug.print("[error] rsync push failed\n{s}", .{result.stderr});
+            std.debug.print("[error] rsync failed\n{s}", .{result.stderr});
         }
         return error.CommandFailed;
     }

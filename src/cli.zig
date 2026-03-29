@@ -28,6 +28,8 @@ pub const Command = union(enum) {
     help,
     status,
     run: RunCommand,
+    sync: []const u8,
+    pull: []const u8,
     offload: []const u8,
     ssh: []const u8,
     down: []const u8,
@@ -52,6 +54,8 @@ pub fn run(
         .help => try printHelp(stdout),
         .status => try handleStatus(allocator, stdout),
         .run => |target| try handleRun(allocator, stdout, stderr, target),
+        .sync => |target| try handleSync(allocator, stdout, stderr, target),
+        .pull => |target| try handlePull(allocator, stdout, stderr, target),
         .offload => |target| try handleOffload(allocator, stdout, stderr, target),
         .ssh => |target| try handleSsh(allocator, stdout, stderr, target),
         .down => |target| try handleDown(allocator, stdout, target),
@@ -68,6 +72,14 @@ pub fn parse(args: []const []const u8) ParseError!Command {
 
     if (std.mem.eql(u8, args[0], "run")) {
         return .{ .run = try parseRunCommand(args) };
+    }
+
+    if (std.mem.eql(u8, args[0], "sync")) {
+        return .{ .sync = try expectSingleTarget(args) };
+    }
+
+    if (std.mem.eql(u8, args[0], "pull")) {
+        return .{ .pull = try expectSingleTarget(args) };
     }
 
     if (std.mem.eql(u8, args[0], "ssh")) {
@@ -128,6 +140,8 @@ pub fn printHelp(writer: anytype) !void {
         \\
         \\Usage:
         \\  rove run <target> [--name <name>]
+        \\  rove sync <name>
+        \\  rove pull <name>
         \\  rove offload <name>
         \\  rove status
         \\  rove ssh <name>
@@ -137,9 +151,11 @@ pub fn printHelp(writer: anytype) !void {
         \\  1. run one target on one provider
         \\  2. track it in local JSON state
         \\  3. wait for SSH and run bootstrap
-        \\  4. offload a workspace into tmux
-        \\  5. SSH into it
-        \\  6. tear it down cleanly
+        \\  4. sync a workspace and run repo-local bootstrap
+        \\  5. offload a workspace into tmux
+        \\  6. pull changes back
+        \\  7. SSH into it
+        \\  8. tear it down cleanly
         \\
         \\Defaults:
         \\  config: ./rove.json
@@ -149,6 +165,7 @@ pub fn printHelp(writer: anytype) !void {
         \\  `run` takes a target from rove.json
         \\  `--name` chooses the tracked instance name
         \\  if omitted, the target name is used
+        \\  `sync`, `pull`, `offload`, `ssh`, and `down` address the tracked instance name
         \\
     );
 }
@@ -454,6 +471,141 @@ fn handleSsh(
     }
 }
 
+fn handleSync(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    stderr: anytype,
+    machine_name: []const u8,
+) !void {
+    var loaded_state = try state.loadOrEmpty(allocator, null);
+    defer loaded_state.deinit();
+
+    const machine_ptr = state.findMachine(&loaded_state.value, machine_name) orelse {
+        try std.fmt.format(
+            stderr,
+            "[error] no tracked machine named '{s}'\n" ++
+                "[hint] run a target first so there is a machine to sync into\n",
+            .{machine_name},
+        );
+        return error.HandledFailure;
+    };
+
+    if (machine_ptr.status == .destroying) {
+        try std.fmt.format(
+            stderr,
+            "[error] machine '{s}' is being destroyed\n",
+            .{machine_name},
+        );
+        return error.HandledFailure;
+    }
+
+    var machine = machine_ptr.*;
+    const resolved = try workspace.discover(allocator, machine.workspace);
+    defer resolved.deinit(allocator);
+
+    try std.fmt.format(
+        stdout,
+        "[info] syncing workspace '{s}' to {s}\n",
+        .{ resolved.local_root, resolved.remote_root },
+    );
+
+    const ran_bootstrap_hook = try syncResolvedWorkspace(
+        allocator,
+        stderr,
+        &machine,
+        machine_name,
+        resolved,
+        .syncing,
+        .sync_failed,
+    );
+
+    machine.workspace = mergedWorkspaceRecord(machine, resolved, null);
+    machine.status = .ready;
+    try state.upsertMachine(allocator, machine, null);
+
+    try std.fmt.format(
+        stdout,
+        "[info] workspace synced for machine '{s}'\n",
+        .{machine_name},
+    );
+    if (ran_bootstrap_hook) {
+        try stdout.writeAll("[info] ran repo-local bootstrap hook .rove/bootstrap.sh\n");
+    }
+}
+
+fn handlePull(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    stderr: anytype,
+    machine_name: []const u8,
+) !void {
+    var loaded_state = try state.loadOrEmpty(allocator, null);
+    defer loaded_state.deinit();
+
+    const machine_ptr = state.findMachine(&loaded_state.value, machine_name) orelse {
+        try std.fmt.format(
+            stderr,
+            "[error] no tracked machine named '{s}'\n" ++
+                "[hint] run a target first so there is a machine to pull from\n",
+            .{machine_name},
+        );
+        return error.HandledFailure;
+    };
+
+    if (machine_ptr.status == .destroying) {
+        try std.fmt.format(
+            stderr,
+            "[error] machine '{s}' is being destroyed\n",
+            .{machine_name},
+        );
+        return error.HandledFailure;
+    }
+
+    const tracked_workspace = machine_ptr.workspace orelse {
+        try std.fmt.format(
+            stderr,
+            "[error] machine '{s}' has no tracked workspace yet\n" ++
+                "[hint] run `rove sync {s}` or `rove offload {s}` first\n",
+            .{ machine_name, machine_name, machine_name },
+        );
+        return error.HandledFailure;
+    };
+
+    var machine = machine_ptr.*;
+    const resolved = try workspace.fromRecord(allocator, tracked_workspace);
+    defer resolved.deinit(allocator);
+
+    machine.status = .pulling;
+    try state.upsertMachine(allocator, machine, null);
+
+    try std.fmt.format(
+        stdout,
+        "[info] pulling workspace from {s} to '{s}'\n",
+        .{ resolved.remote_root, resolved.local_root },
+    );
+
+    sync.pullWorkspaceFiles(allocator, machine, resolved) catch |err| {
+        machine.status = .pull_failed;
+        try state.upsertMachine(allocator, machine, null);
+
+        try std.fmt.format(
+            stderr,
+            "[error] workspace pull failed for machine '{s}': {s}\n",
+            .{ machine_name, @errorName(err) },
+        );
+        return error.HandledFailure;
+    };
+
+    machine.status = .ready;
+    try state.upsertMachine(allocator, machine, null);
+
+    try std.fmt.format(
+        stdout,
+        "[info] workspace pulled for machine '{s}'\n",
+        .{machine_name},
+    );
+}
+
 fn handleOffload(
     allocator: std.mem.Allocator,
     stdout: anytype,
@@ -517,17 +669,15 @@ fn handleOffload(
         .{ resolved.local_root, resolved.remote_root, tmux.backendName(planned.backend), planned.restore.session_name },
     );
 
-    sync.pushWorkspace(allocator, machine, resolved) catch |err| {
-        machine.status = .offload_failed;
-        try state.upsertMachine(allocator, machine, null);
-
-        try std.fmt.format(
-            stderr,
-            "[error] workspace sync failed for machine '{s}': {s}\n",
-            .{ target_name, @errorName(err) },
-        );
-        return error.HandledFailure;
-    };
+    const ran_bootstrap_hook = try syncResolvedWorkspace(
+        allocator,
+        stderr,
+        &machine,
+        target_name,
+        resolved,
+        .offloading,
+        .offload_failed,
+    );
 
     tmux.applyRemote(allocator, machine, planned.restore) catch |err| {
         machine.status = .offload_failed;
@@ -541,14 +691,13 @@ fn handleOffload(
         return error.HandledFailure;
     };
 
-    const workspace_record = model.WorkspaceRecord{
-        .local_path = resolved.local_root,
-        .remote_path = resolved.remote_root,
-        .tmux_session = planned.restore.session_name,
-    };
-    machine.workspace = workspace_record;
+    machine.workspace = mergedWorkspaceRecord(machine, resolved, planned.restore.session_name);
     machine.status = .ready;
     try state.upsertMachine(allocator, machine, null);
+
+    if (ran_bootstrap_hook) {
+        try stdout.writeAll("[info] ran repo-local bootstrap hook .rove/bootstrap.sh\n");
+    }
 
     const attach_command = try tmux.attachCommand(allocator, planned.restore);
     defer allocator.free(attach_command);
@@ -650,6 +799,50 @@ fn renderPlacementSummary(
     return allocator.dupe(u8, "runtime-selected region");
 }
 
+fn syncResolvedWorkspace(
+    allocator: std.mem.Allocator,
+    stderr: anytype,
+    machine: *model.MachineRecord,
+    machine_name: []const u8,
+    resolved: workspace.ResolvedWorkspace,
+    active_status: model.LifecycleStatus,
+    failure_status: model.LifecycleStatus,
+) !bool {
+    machine.status = active_status;
+    try state.upsertMachine(allocator, machine.*, null);
+
+    const result = sync.syncWorkspace(allocator, machine.*, resolved) catch |err| {
+        machine.status = failure_status;
+        try state.upsertMachine(allocator, machine.*, null);
+
+        try std.fmt.format(
+            stderr,
+            "[error] workspace sync failed for machine '{s}': {s}\n",
+            .{ machine_name, @errorName(err) },
+        );
+        return error.HandledFailure;
+    };
+
+    return result.ran_bootstrap_hook;
+}
+
+fn mergedWorkspaceRecord(
+    machine: model.MachineRecord,
+    resolved: workspace.ResolvedWorkspace,
+    tmux_session: ?[]const u8,
+) model.WorkspaceRecord {
+    return .{
+        .local_path = resolved.local_root,
+        .remote_path = resolved.remote_root,
+        .tmux_session = if (tmux_session) |session|
+            session
+        else if (machine.workspace) |existing|
+            existing.tmux_session
+        else
+            null,
+    };
+}
+
 fn isValidInstanceName(name: []const u8) bool {
     if (name.len == 0) return false;
 
@@ -690,6 +883,24 @@ test "parse run target with explicit name" {
             try std.testing.expectEqualStrings("devbox", run_command.target);
             try std.testing.expectEqualStrings("sam-east", run_command.name.?);
         },
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse sync target" {
+    const command = try parse(&.{ "sync", "sam-east" });
+
+    switch (command) {
+        .sync => |name| try std.testing.expectEqualStrings("sam-east", name),
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse pull target" {
+    const command = try parse(&.{ "pull", "sam-east" });
+
+    switch (command) {
+        .pull => |name| try std.testing.expectEqualStrings("sam-east", name),
         else => return error.InvalidArguments,
     }
 }
