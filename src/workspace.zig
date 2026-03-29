@@ -5,7 +5,9 @@ const model = @import("model.zig");
 pub const bootstrap_hook_path = ".rove/bootstrap.sh";
 
 pub const Error = error{
+    AmbiguousWorkspaceSelector,
     NoTrackedWorkspace,
+    WorkspaceNotFound,
 };
 
 pub const ResolvedWorkspace = struct {
@@ -68,7 +70,12 @@ pub fn discover(
 pub fn resolvePull(
     allocator: std.mem.Allocator,
     machine: model.MachineRecord,
+    selector: ?[]const u8,
 ) !ResolvedWorkspace {
+    if (selector) |value| {
+        return fromRecord(allocator, try resolveTrackedSelector(machine, value));
+    }
+
     var current = try currentContext(allocator);
     defer current.deinit(allocator);
 
@@ -81,6 +88,27 @@ pub fn resolvePull(
     }
 
     return error.NoTrackedWorkspace;
+}
+
+pub fn resolveTrackedSelector(
+    machine: model.MachineRecord,
+    selector: []const u8,
+) Error!model.WorkspaceRecord {
+    var found: ?model.WorkspaceRecord = null;
+
+    if (machine.workspaces.len > 0) {
+        for (machine.workspaces) |record| {
+            if (!matchesSelector(record, selector)) continue;
+            if (found != null) return error.AmbiguousWorkspaceSelector;
+            found = record;
+        }
+    } else if (machine.workspace) |record| {
+        if (matchesSelector(record, selector)) {
+            found = record;
+        }
+    }
+
+    return found orelse error.WorkspaceNotFound;
 }
 
 pub fn fromRecord(
@@ -359,6 +387,15 @@ fn mergeRecord(
     };
 }
 
+fn matchesSelector(
+    record: model.WorkspaceRecord,
+    selector: []const u8,
+) bool {
+    return std.mem.eql(u8, recordName(record), selector) or
+        std.mem.eql(u8, record.local_path, selector) or
+        std.mem.eql(u8, record.remote_path, selector);
+}
+
 fn detectRepoRoot(
     allocator: std.mem.Allocator,
     current_dir: []const u8,
@@ -542,4 +579,45 @@ test "default remote root adds suffix when basename collides" {
     defer allocator.free(remote_root);
 
     try std.testing.expect(std.mem.startsWith(u8, remote_root, "$HOME/work/project-"));
+}
+
+test "resolve tracked selector by local path" {
+    const record = try resolveTrackedSelector(.{
+        .name = "devbox",
+        .provider = .fly,
+        .id = "machine-1",
+        .host = "devbox.fly.dev",
+        .ssh_user = "root",
+        .workspaces = &.{.{
+            .name = "project",
+            .local_path = "/tmp/project",
+            .remote_path = "$HOME/work/project",
+        }},
+        .status = .ready,
+    }, "/tmp/project");
+
+    try std.testing.expectEqualStrings("/tmp/project", record.local_path);
+}
+
+test "resolve tracked selector rejects ambiguous labels" {
+    try std.testing.expectError(error.AmbiguousWorkspaceSelector, resolveTrackedSelector(.{
+        .name = "devbox",
+        .provider = .fly,
+        .id = "machine-1",
+        .host = "devbox.fly.dev",
+        .ssh_user = "root",
+        .workspaces = &.{
+            .{
+                .name = "project",
+                .local_path = "/tmp/one/project",
+                .remote_path = "$HOME/work/project",
+            },
+            .{
+                .name = "project",
+                .local_path = "/tmp/two/project",
+                .remote_path = "$HOME/work/project-2",
+            },
+        },
+        .status = .ready,
+    }, "project"));
 }

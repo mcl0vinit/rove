@@ -28,6 +28,7 @@ pub const PullCommand = struct {
     machine_name: []const u8,
     preview: bool = false,
     force: bool = false,
+    workspace_selector: ?[]const u8 = null,
 };
 
 pub const Command = union(enum) {
@@ -164,6 +165,15 @@ fn parsePullCommand(args: []const []const u8) ParseError!PullCommand {
             continue;
         }
 
+        if (std.mem.eql(u8, args[index], "--workspace")) {
+            if (command.workspace_selector != null) return error.InvalidArguments;
+            if (index + 1 >= args.len) return error.InvalidArguments;
+            if (args[index + 1].len == 0) return error.InvalidArguments;
+            command.workspace_selector = args[index + 1];
+            index += 2;
+            continue;
+        }
+
         return error.InvalidArguments;
     }
 
@@ -177,7 +187,7 @@ pub fn printHelp(writer: anytype) !void {
         \\Usage:
         \\  rove run <target> [--name <name>]
         \\  rove sync <name>
-        \\  rove pull <name> [--preview] [--force]
+        \\  rove pull <name> [--workspace <label-or-path>] [--preview] [--force]
         \\  rove offload <name>
         \\  rove status
         \\  rove ssh <name>
@@ -202,6 +212,7 @@ pub fn printHelp(writer: anytype) !void {
         \\  `--name` chooses the tracked instance name
         \\  if omitted, the target name is used
         \\  `sync`, `pull`, `offload`, `ssh`, and `down` address the tracked instance name
+        \\  `pull --workspace` selects one tracked workspace by label, local path, or remote path
         \\  `pull --preview` shows rsync changes without writing local files
         \\  `pull` refuses to overwrite a dirty local git repo unless `--force` is set
         \\
@@ -631,7 +642,25 @@ fn handlePull(
     }
 
     var machine = machine_ptr.*;
-    const resolved = workspace.resolvePull(allocator, machine) catch |err| switch (err) {
+    const resolved = workspace.resolvePull(allocator, machine, command.workspace_selector) catch |err| switch (err) {
+        error.WorkspaceNotFound => {
+            try std.fmt.format(
+                stderr,
+                "[error] machine '{s}' has no tracked workspace matching '{s}'\n" ++
+                    "[hint] use the workspace label, local path, or remote path from `rove status`\n",
+                .{ command.machine_name, command.workspace_selector.? },
+            );
+            return error.HandledFailure;
+        },
+        error.AmbiguousWorkspaceSelector => {
+            try std.fmt.format(
+                stderr,
+                "[error] workspace selector '{s}' is ambiguous for machine '{s}'\n" ++
+                    "[hint] use the full local path or remote path to disambiguate\n",
+                .{ command.workspace_selector.?, command.machine_name },
+            );
+            return error.HandledFailure;
+        },
         error.NoTrackedWorkspace => {
             try std.fmt.format(
                 stderr,
@@ -720,14 +749,19 @@ fn handlePull(
     machine.status = .ready;
     try state.upsertMachine(allocator, machine, null);
 
-    try std.fmt.format(
-        stdout,
-        if (has_changes)
-            "[info] workspace pulled for machine '{s}'\n"
-        else
+    if (has_changes) {
+        try std.fmt.format(
+            stdout,
+            "[info] workspace pulled for machine '{s}'\n",
+            .{command.machine_name},
+        );
+    } else {
+        try std.fmt.format(
+            stdout,
             "[info] workspace already up to date for machine '{s}'\n",
-        .{command.machine_name},
-    );
+            .{command.machine_name},
+        );
+    }
 }
 
 fn handleOffload(
@@ -1015,19 +1049,21 @@ test "parse pull target" {
             try std.testing.expectEqualStrings("sam-east", pull_command.machine_name);
             try std.testing.expect(!pull_command.preview);
             try std.testing.expect(!pull_command.force);
+            try std.testing.expect(pull_command.workspace_selector == null);
         },
         else => return error.InvalidArguments,
     }
 }
 
 test "parse pull target with preview and force" {
-    const command = try parse(&.{ "pull", "sam-east", "--preview", "--force" });
+    const command = try parse(&.{ "pull", "sam-east", "--workspace", "$HOME/work/repo", "--preview", "--force" });
 
     switch (command) {
         .pull => |pull_command| {
             try std.testing.expectEqualStrings("sam-east", pull_command.machine_name);
             try std.testing.expect(pull_command.preview);
             try std.testing.expect(pull_command.force);
+            try std.testing.expectEqualStrings("$HOME/work/repo", pull_command.workspace_selector.?);
         },
         else => return error.InvalidArguments,
     }
