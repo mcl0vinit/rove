@@ -61,6 +61,7 @@ pub const WorkspaceRecord = struct {
 
 pub const MachineRecord = struct {
     name: []const u8,
+    target_name: ?[]const u8 = null,
     provider: ProviderKind,
     id: []const u8,
     machine_name: ?[]const u8 = null,

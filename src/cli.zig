@@ -19,10 +19,15 @@ pub const HandledFailure = error{
     HandledFailure,
 };
 
+pub const RunCommand = struct {
+    target: []const u8,
+    name: ?[]const u8 = null,
+};
+
 pub const Command = union(enum) {
     help,
     status,
-    run: []const u8,
+    run: RunCommand,
     offload: []const u8,
     ssh: []const u8,
     down: []const u8,
@@ -62,7 +67,7 @@ pub fn parse(args: []const []const u8) ParseError!Command {
     }
 
     if (std.mem.eql(u8, args[0], "run")) {
-        return .{ .run = try expectSingleTarget(args) };
+        return .{ .run = try parseRunCommand(args) };
     }
 
     if (std.mem.eql(u8, args[0], "ssh")) {
@@ -92,16 +97,41 @@ fn expectSingleTarget(args: []const []const u8) ParseError![]const u8 {
     return args[1];
 }
 
+fn parseRunCommand(args: []const []const u8) ParseError!RunCommand {
+    if (args.len < 2) return error.InvalidArguments;
+    if (args[1].len == 0) return error.InvalidArguments;
+
+    var command = RunCommand{
+        .target = args[1],
+    };
+
+    var index: usize = 2;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--name")) {
+            if (command.name != null) return error.InvalidArguments;
+            if (index + 1 >= args.len) return error.InvalidArguments;
+            if (args[index + 1].len == 0) return error.InvalidArguments;
+            command.name = args[index + 1];
+            index += 2;
+            continue;
+        }
+
+        return error.InvalidArguments;
+    }
+
+    return command;
+}
+
 pub fn printHelp(writer: anytype) !void {
     try writer.writeAll(
         \\rove
         \\
         \\Usage:
-        \\  rove run <target>
-        \\  rove offload <target>
+        \\  rove run <target> [--name <name>]
+        \\  rove offload <name>
         \\  rove status
-        \\  rove ssh <target>
-        \\  rove down <target>
+        \\  rove ssh <name>
+        \\  rove down <name>
         \\
         \\This scaffold matches the handoff's first milestone:
         \\  1. run one target on one provider
@@ -114,6 +144,11 @@ pub fn printHelp(writer: anytype) !void {
         \\Defaults:
         \\  config: ./rove.json
         \\  state: ~/.rove/state.json
+        \\
+        \\Naming:
+        \\  `run` takes a target from rove.json
+        \\  `--name` chooses the tracked instance name
+        \\  if omitted, the target name is used
         \\
     );
 }
@@ -133,17 +168,19 @@ fn handleStatus(
         return;
     }
 
-    try stdout.writeAll("NAME\tPROVIDER\tSTATUS\tHOST\tWORKSPACE\n");
+    try stdout.writeAll("NAME\tTARGET\tPROVIDER\tSTATUS\tHOST\tWORKSPACE\n");
     for (loaded_state.value.machines) |machine| {
         const workspace_path = if (machine.workspace) |workspace_record|
             workspace_record.remote_path
         else
             "-";
+        const target_name = machine.target_name orelse machine.name;
         try std.fmt.format(
             stdout,
-            "{s}\t{s}\t{s}\t{s}\t{s}\n",
+            "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n",
             .{
                 machine.name,
+                target_name,
                 model.providerName(machine.provider),
                 model.statusName(machine.status),
                 machine.host,
@@ -157,17 +194,28 @@ fn handleRun(
     allocator: std.mem.Allocator,
     stdout: anytype,
     stderr: anytype,
-    target_name: []const u8,
+    command: RunCommand,
 ) !void {
+    const instance_name = command.name orelse command.target;
+    if (!isValidInstanceName(instance_name)) {
+        try std.fmt.format(
+            stderr,
+            "[error] invalid instance name '{s}'\n" ++
+                "[hint] use letters, digits, '-', '_' or '.'\n",
+            .{instance_name},
+        );
+        return error.HandledFailure;
+    }
+
     var loaded_state = try state.loadOrEmpty(allocator, null);
     defer loaded_state.deinit();
 
-    if (state.findMachine(&loaded_state.value, target_name) != null) {
+    if (state.findMachine(&loaded_state.value, instance_name) != null) {
         try std.fmt.format(
             stderr,
-            "[error] target '{s}' already has a tracked machine\n" ++
+            "[error] instance '{s}' already has a tracked machine\n" ++
                 "[hint] use `rove status` to inspect it or `rove down {s}` before creating another\n",
-            .{ target_name, target_name },
+            .{ instance_name, instance_name },
         );
         return error.HandledFailure;
     }
@@ -186,13 +234,13 @@ fn handleRun(
     };
     defer loaded_config.deinit();
 
-    const target = config.resolveTarget(&loaded_config.value, target_name) catch |err| switch (err) {
+    const target = config.resolveTarget(&loaded_config.value, command.target) catch |err| switch (err) {
         error.TargetNotFound => {
             try std.fmt.format(
                 stderr,
                 "[error] unknown target '{s}'\n" ++
                     "[hint] add it to {s}\n",
-                .{ target_name, paths.defaultConfigPath() },
+                .{ command.target, paths.defaultConfigPath() },
             );
             return error.HandledFailure;
         },
@@ -204,6 +252,7 @@ fn handleRun(
 
     const created = provider.create(allocator, target.provider, .{
         .target = target,
+        .instance_name = instance_name,
     }) catch |err| {
         try std.fmt.format(
             stderr,
@@ -215,7 +264,8 @@ fn handleRun(
     defer created.deinit(allocator);
 
     var machine = model.MachineRecord{
-        .name = target.name,
+        .name = instance_name,
+        .target_name = target.name,
         .provider = target.provider,
         .id = created.machine_id,
         .machine_name = created.machine_name,
@@ -230,7 +280,9 @@ fn handleRun(
 
     try std.fmt.format(
         stdout,
-        "[info] target '{s}' created\n" ++
+        "[info] instance '{s}' created from target '{s}'\n" ++
+            "[info] target: {s}\n" ++
+            "[info] name: {s}\n" ++
             "[info] provider: {s}\n" ++
             "[info] app: {s}\n" ++
             "[info] machine_id: {s}\n" ++
@@ -239,7 +291,10 @@ fn handleRun(
             "[info] placement: {s}\n" ++
             "[info] host: {s}\n",
         .{
+            machine.name,
             target.name,
+            target.name,
+            machine.name,
             model.providerName(target.provider),
             target.app,
             created.machine_id,
@@ -265,9 +320,9 @@ fn handleRun(
 
         try std.fmt.format(
             stderr,
-            "[error] ssh did not become ready for target '{s}': {s}\n" ++
+            "[error] ssh did not become ready for instance '{s}': {s}\n" ++
                 "[hint] inspect the machine with `rove status` or `rove ssh {s}` once access works\n",
-            .{ target.name, @errorName(err), target.name },
+            .{ machine.name, @errorName(err), machine.name },
         );
         return error.HandledFailure;
     };
@@ -288,9 +343,9 @@ fn handleRun(
 
         try std.fmt.format(
             stderr,
-            "[error] bootstrap failed for target '{s}': {s}\n" ++
+            "[error] bootstrap failed for instance '{s}': {s}\n" ++
                 "[hint] the machine is still running; use `rove ssh {s}` to inspect it\n",
-            .{ target.name, @errorName(err), target.name },
+            .{ machine.name, @errorName(err), machine.name },
         );
         return error.HandledFailure;
     };
@@ -311,9 +366,9 @@ fn handleRun(
 
             try std.fmt.format(
                 stderr,
-                "[error] profile apply failed for target '{s}': {s}\n" ++
+                "[error] profile apply failed for instance '{s}': {s}\n" ++
                     "[hint] the machine is still running; use `rove ssh {s}` to inspect it\n",
-                .{ target.name, @errorName(err), target.name },
+                .{ machine.name, @errorName(err), machine.name },
             );
             return error.HandledFailure;
         };
@@ -325,9 +380,9 @@ fn handleRun(
 
             try std.fmt.format(
                 stderr,
-                "[error] failed to reconcile bootstrap after profile apply for target '{s}': {s}\n" ++
+                "[error] failed to reconcile bootstrap after profile apply for instance '{s}': {s}\n" ++
                     "[hint] the machine is still running; use `rove ssh {s}` to inspect it\n",
-                .{ target.name, @errorName(err), target.name },
+                .{ machine.name, @errorName(err), machine.name },
             );
             return error.HandledFailure;
         };
@@ -338,9 +393,9 @@ fn handleRun(
 
     try std.fmt.format(
         stdout,
-        "[info] target '{s}' is ready\n" ++
+        "[info] instance '{s}' is ready\n" ++
             "[hint] connect with `rove ssh {s}`\n",
-        .{ target.name, target.name },
+        .{ machine.name, machine.name },
     );
 }
 
@@ -356,8 +411,8 @@ fn handleSsh(
     const machine = state.findMachine(&loaded_state.value, target_name) orelse {
         try std.fmt.format(
             stdout,
-            "[error] no tracked machine for target '{s}'\n" ++
-                "[hint] run the target first so SSH knows where to connect\n",
+            "[error] no tracked machine named '{s}'\n" ++
+                "[hint] run a target first so SSH knows where to connect\n",
             .{target_name},
         );
         return error.HandledFailure;
@@ -366,7 +421,7 @@ fn handleSsh(
     if (machine.status == .destroying) {
         try std.fmt.format(
             stderr,
-            "[error] target '{s}' is being destroyed\n",
+            "[error] machine '{s}' is being destroyed\n",
             .{target_name},
         );
         return error.HandledFailure;
@@ -375,7 +430,7 @@ fn handleSsh(
     const term = ssh.openInteractive(allocator, machine.*) catch |err| {
         try std.fmt.format(
             stderr,
-            "[error] failed to start ssh for target '{s}': {s}\n",
+            "[error] failed to start ssh for machine '{s}': {s}\n",
             .{ target_name, @errorName(err) },
         );
         return error.HandledFailure;
@@ -411,8 +466,8 @@ fn handleOffload(
     const machine_ptr = state.findMachine(&loaded_state.value, target_name) orelse {
         try std.fmt.format(
             stderr,
-            "[error] no tracked machine for target '{s}'\n" ++
-                "[hint] run the target first so there is a machine to offload into\n",
+            "[error] no tracked machine named '{s}'\n" ++
+                "[hint] run a target first so there is a machine to offload into\n",
             .{target_name},
         );
         return error.HandledFailure;
@@ -421,7 +476,7 @@ fn handleOffload(
     if (machine_ptr.status == .destroying) {
         try std.fmt.format(
             stderr,
-            "[error] target '{s}' is being destroyed\n",
+            "[error] machine '{s}' is being destroyed\n",
             .{target_name},
         );
         return error.HandledFailure;
@@ -439,7 +494,8 @@ fn handleOffload(
 
     const planned = planned: {
         if (loaded_config) |*parsed| {
-            const target = config.resolveTarget(&parsed.value, target_name) catch |err| switch (err) {
+            const config_target_name = machine.target_name orelse machine.name;
+            const target = config.resolveTarget(&parsed.value, config_target_name) catch |err| switch (err) {
                 error.TargetNotFound => break :planned try tmux.planOffload(allocator, .{}, resolved),
                 else => return err,
             };
@@ -467,7 +523,7 @@ fn handleOffload(
 
         try std.fmt.format(
             stderr,
-            "[error] workspace sync failed for target '{s}': {s}\n",
+            "[error] workspace sync failed for machine '{s}': {s}\n",
             .{ target_name, @errorName(err) },
         );
         return error.HandledFailure;
@@ -479,7 +535,7 @@ fn handleOffload(
 
         try std.fmt.format(
             stderr,
-            "[error] tmux restore failed for target '{s}': {s}\n",
+            "[error] tmux restore failed for machine '{s}': {s}\n",
             .{ target_name, @errorName(err) },
         );
         return error.HandledFailure;
@@ -500,7 +556,7 @@ fn handleOffload(
     const term = ssh.openInteractiveCommand(allocator, machine, attach_command) catch |err| {
         try std.fmt.format(
             stderr,
-            "[error] failed to attach remote tmux for target '{s}': {s}\n",
+            "[error] failed to attach remote tmux for machine '{s}': {s}\n",
             .{ target_name, @errorName(err) },
         );
         return error.HandledFailure;
@@ -535,8 +591,8 @@ fn handleDown(
     const machine = state.findMachine(&loaded_state.value, target_name) orelse {
         try std.fmt.format(
             stdout,
-            "[error] no tracked machine for target '{s}'\n" ++
-                "[hint] nothing to destroy until the target has been run at least once\n",
+            "[error] no tracked machine named '{s}'\n" ++
+                "[hint] nothing to destroy until a machine has been run at least once\n",
             .{target_name},
         );
         return error.HandledFailure;
@@ -550,7 +606,7 @@ fn handleDown(
         .app = machine.app orelse {
             try std.fmt.format(
                 stdout,
-                "[error] tracked machine for '{s}' is missing app metadata\n",
+                "[error] tracked machine '{s}' is missing app metadata\n",
                 .{target_name},
             );
             return error.HandledFailure;
@@ -559,7 +615,7 @@ fn handleDown(
     }) catch |err| {
         try std.fmt.format(
             stdout,
-            "[error] failed to destroy target '{s}': {s}\n",
+            "[error] failed to destroy machine '{s}': {s}\n",
             .{ target_name, @errorName(err) },
         );
         return error.HandledFailure;
@@ -569,7 +625,7 @@ fn handleDown(
 
     try std.fmt.format(
         stdout,
-        "[info] target '{s}' destroyed\n" ++
+        "[info] machine '{s}' destroyed\n" ++
             "[info] machine_id: {s}\n" ++
             "[hint] local state has been cleared\n",
         .{ target_name, machine.id },
@@ -594,6 +650,17 @@ fn renderPlacementSummary(
     return allocator.dupe(u8, "runtime-selected region");
 }
 
+fn isValidInstanceName(name: []const u8) bool {
+    if (name.len == 0) return false;
+
+    for (name) |char| {
+        if (std.ascii.isAlphanumeric(char) or char == '-' or char == '_' or char == '.') continue;
+        return false;
+    }
+
+    return true;
+}
+
 test "parse status" {
     const command = try parse(&.{"status"});
 
@@ -607,13 +674,32 @@ test "parse run target" {
     const command = try parse(&.{ "run", "gpu" });
 
     switch (command) {
-        .run => |target| try std.testing.expectEqualStrings("gpu", target),
+        .run => |run_command| {
+            try std.testing.expectEqualStrings("gpu", run_command.target);
+            try std.testing.expect(run_command.name == null);
+        },
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse run target with explicit name" {
+    const command = try parse(&.{ "run", "devbox", "--name", "sam-east" });
+
+    switch (command) {
+        .run => |run_command| {
+            try std.testing.expectEqualStrings("devbox", run_command.target);
+            try std.testing.expectEqualStrings("sam-east", run_command.name.?);
+        },
         else => return error.InvalidArguments,
     }
 }
 
 test "reject missing target" {
     try std.testing.expectError(error.InvalidArguments, parse(&.{"ssh"}));
+}
+
+test "reject run name without value" {
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "run", "devbox", "--name" }));
 }
 
 test "reject unknown command" {

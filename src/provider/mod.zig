@@ -4,6 +4,7 @@ const fly = @import("fly.zig");
 
 pub const CreateRequest = struct {
     target: *const model.TargetConfig,
+    instance_name: []const u8,
     verbose: bool = false,
 };
 

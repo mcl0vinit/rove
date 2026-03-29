@@ -134,7 +134,7 @@ When we wire this into `rove.json`, a Fly CPU target will probably look roughly 
 
 ```json
 {
-  "name": "cpu",
+  "name": "devbox",
   "provider": "fly",
   "app": "devbox",
   "image": "registry.fly.io/devbox:deployment-<id>",
