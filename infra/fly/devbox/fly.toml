@@ -1,0 +1,31 @@
+app = "devbox"
+# Intentionally no `primary_region`.
+# For Rove-managed Machines, the better default is to let Fly place each
+# Machine close to where the command is run unless the target pins a region.
+console_command = "/nix/var/nix/profiles/default/bin/bash"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  ROVE_PERSIST_DIR = "/persist"
+
+[[services]]
+  internal_port = 2222
+  protocol = "tcp"
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 22
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"
+  cpu_kind = "shared"
+
+# Uncomment once you've created a Fly volume:
+# [[mounts]]
+#   source = "data"
+#   destination = "/persist"
