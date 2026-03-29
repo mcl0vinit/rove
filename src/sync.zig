@@ -15,8 +15,25 @@ const default_excludes = [_][]const u8{
     "dist/",
 };
 
+const RsyncOptions = struct {
+    dry_run: bool = false,
+    itemize_changes: bool = false,
+};
+
 pub const SyncResult = struct {
     ran_bootstrap_hook: bool = false,
+};
+
+pub const PullPreview = struct {
+    changes: []u8,
+
+    pub fn deinit(self: PullPreview, allocator: std.mem.Allocator) void {
+        allocator.free(self.changes);
+    }
+
+    pub fn hasChanges(self: PullPreview) bool {
+        return std.mem.trim(u8, self.changes, "\r\n\t ").len > 0;
+    }
 };
 
 pub fn syncWorkspace(
@@ -50,7 +67,8 @@ pub fn pushWorkspaceFiles(
     );
     defer allocator.free(destination);
 
-    try runRsync(allocator, machine, source, destination);
+    var result = try runRsync(allocator, machine, source, destination, .{});
+    defer result.deinit(allocator);
 }
 
 pub fn pullWorkspaceFiles(
@@ -60,20 +78,36 @@ pub fn pullWorkspaceFiles(
 ) !void {
     try ensureLocalWorkspaceRoot(resolved.local_root);
 
-    const remote_path = try workspace.quoteRemotePath(allocator, resolved.remote_root);
-    defer allocator.free(remote_path);
-
-    const source = try std.fmt.allocPrint(
-        allocator,
-        "{s}@{s}:{s}/",
-        .{ machine.ssh_user, machine.host, remote_path },
-    );
+    const source = try pullSourceSpec(allocator, machine, resolved.remote_root);
     defer allocator.free(source);
 
     const destination = try std.fmt.allocPrint(allocator, "{s}/", .{resolved.local_root});
     defer allocator.free(destination);
 
-    try runRsync(allocator, machine, source, destination);
+    var result = try runRsync(allocator, machine, source, destination, .{});
+    defer result.deinit(allocator);
+}
+
+pub fn previewPullWorkspace(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    resolved: workspace.ResolvedWorkspace,
+) !PullPreview {
+    const source = try pullSourceSpec(allocator, machine, resolved.remote_root);
+    defer allocator.free(source);
+
+    const destination = try std.fmt.allocPrint(allocator, "{s}/", .{resolved.local_root});
+    defer allocator.free(destination);
+
+    const result = try runRsync(allocator, machine, source, destination, .{
+        .dry_run = true,
+        .itemize_changes = true,
+    });
+    defer allocator.free(result.stderr);
+
+    return .{
+        .changes = result.stdout,
+    };
 }
 
 pub fn runRemoteBootstrapHook(
@@ -160,12 +194,28 @@ fn ensureLocalWorkspaceRoot(local_root: []const u8) !void {
     try std.fs.cwd().makePath(local_root);
 }
 
+fn pullSourceSpec(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    remote_root: []const u8,
+) ![]u8 {
+    const remote_path = try workspace.quoteRemotePath(allocator, remote_root);
+    defer allocator.free(remote_path);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}@{s}:{s}/",
+        .{ machine.ssh_user, machine.host, remote_path },
+    );
+}
+
 fn runRsync(
     allocator: std.mem.Allocator,
     machine: model.MachineRecord,
     source: []const u8,
     destination: []const u8,
-) !void {
+    options: RsyncOptions,
+) !exec.Result {
     const transport = try ssh.rsyncTransportCommand(allocator, machine);
     defer allocator.free(transport);
 
@@ -173,13 +223,19 @@ fn runRsync(
     defer args.deinit(allocator);
 
     try args.appendSlice(allocator, &.{ "rsync", "-az", "-e", transport });
+    if (options.dry_run) {
+        try args.append(allocator, "--dry-run");
+    }
+    if (options.itemize_changes) {
+        try args.append(allocator, "--itemize-changes");
+    }
     for (default_excludes) |pattern| {
         try args.appendSlice(allocator, &.{ "--exclude", pattern });
     }
     try args.appendSlice(allocator, &.{ source, destination });
 
     const result = try exec.run(allocator, args.items);
-    defer result.deinit(allocator);
+    errdefer result.deinit(allocator);
 
     if (!result.succeeded()) {
         if (result.stderr.len > 0) {
@@ -187,4 +243,22 @@ fn runRsync(
         }
         return error.CommandFailed;
     }
+
+    return result;
+}
+
+test "preview reports changes when rsync itemized output is non-empty" {
+    const preview = PullPreview{
+        .changes = "cd+++++++++ src/main.zig\n",
+    };
+
+    try std.testing.expect(preview.hasChanges());
+}
+
+test "preview reports no changes for whitespace-only output" {
+    const preview = PullPreview{
+        .changes = "\n",
+    };
+
+    try std.testing.expect(!preview.hasChanges());
 }

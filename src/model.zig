@@ -58,6 +58,7 @@ pub const ConfigFile = struct {
 };
 
 pub const WorkspaceRecord = struct {
+    name: ?[]const u8 = null,
     local_path: []const u8,
     remote_path: []const u8,
     tmux_session: ?[]const u8 = null,
@@ -74,6 +75,7 @@ pub const MachineRecord = struct {
     region: ?[]const u8 = null,
     ssh_user: []const u8,
     workspace: ?WorkspaceRecord = null,
+    workspaces: []const WorkspaceRecord = &.{},
     status: LifecycleStatus,
 };
 

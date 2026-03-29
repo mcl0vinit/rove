@@ -24,12 +24,18 @@ pub const RunCommand = struct {
     name: ?[]const u8 = null,
 };
 
+pub const PullCommand = struct {
+    machine_name: []const u8,
+    preview: bool = false,
+    force: bool = false,
+};
+
 pub const Command = union(enum) {
     help,
     status,
     run: RunCommand,
     sync: []const u8,
-    pull: []const u8,
+    pull: PullCommand,
     offload: []const u8,
     ssh: []const u8,
     down: []const u8,
@@ -55,7 +61,7 @@ pub fn run(
         .status => try handleStatus(allocator, stdout),
         .run => |target| try handleRun(allocator, stdout, stderr, target),
         .sync => |target| try handleSync(allocator, stdout, stderr, target),
-        .pull => |target| try handlePull(allocator, stdout, stderr, target),
+        .pull => |pull_command| try handlePull(allocator, stdout, stderr, pull_command),
         .offload => |target| try handleOffload(allocator, stdout, stderr, target),
         .ssh => |target| try handleSsh(allocator, stdout, stderr, target),
         .down => |target| try handleDown(allocator, stdout, target),
@@ -79,7 +85,7 @@ pub fn parse(args: []const []const u8) ParseError!Command {
     }
 
     if (std.mem.eql(u8, args[0], "pull")) {
-        return .{ .pull = try expectSingleTarget(args) };
+        return .{ .pull = try parsePullCommand(args) };
     }
 
     if (std.mem.eql(u8, args[0], "ssh")) {
@@ -134,6 +140,36 @@ fn parseRunCommand(args: []const []const u8) ParseError!RunCommand {
     return command;
 }
 
+fn parsePullCommand(args: []const []const u8) ParseError!PullCommand {
+    if (args.len < 2) return error.InvalidArguments;
+    if (args[1].len == 0) return error.InvalidArguments;
+
+    var command = PullCommand{
+        .machine_name = args[1],
+    };
+
+    var index: usize = 2;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--preview")) {
+            if (command.preview) return error.InvalidArguments;
+            command.preview = true;
+            index += 1;
+            continue;
+        }
+
+        if (std.mem.eql(u8, args[index], "--force")) {
+            if (command.force) return error.InvalidArguments;
+            command.force = true;
+            index += 1;
+            continue;
+        }
+
+        return error.InvalidArguments;
+    }
+
+    return command;
+}
+
 pub fn printHelp(writer: anytype) !void {
     try writer.writeAll(
         \\rove
@@ -141,7 +177,7 @@ pub fn printHelp(writer: anytype) !void {
         \\Usage:
         \\  rove run <target> [--name <name>]
         \\  rove sync <name>
-        \\  rove pull <name>
+        \\  rove pull <name> [--preview] [--force]
         \\  rove offload <name>
         \\  rove status
         \\  rove ssh <name>
@@ -166,6 +202,8 @@ pub fn printHelp(writer: anytype) !void {
         \\  `--name` chooses the tracked instance name
         \\  if omitted, the target name is used
         \\  `sync`, `pull`, `offload`, `ssh`, and `down` address the tracked instance name
+        \\  `pull --preview` shows rsync changes without writing local files
+        \\  `pull` refuses to overwrite a dirty local git repo unless `--force` is set
         \\
     );
 }
@@ -187,23 +225,50 @@ fn handleStatus(
 
     try stdout.writeAll("NAME\tTARGET\tPROVIDER\tSTATUS\tHOST\tWORKSPACE\n");
     for (loaded_state.value.machines) |machine| {
-        const workspace_path = if (machine.workspace) |workspace_record|
-            workspace_record.remote_path
-        else
-            "-";
         const target_name = machine.target_name orelse machine.name;
-        try std.fmt.format(
-            stdout,
-            "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n",
-            .{
-                machine.name,
-                target_name,
-                model.providerName(machine.provider),
-                model.statusName(machine.status),
-                machine.host,
-                workspace_path,
-            },
-        );
+        if (workspace.activeTracked(machine)) |tracked_workspace| {
+            const tracked_count = workspace.trackedCount(machine);
+            if (tracked_count > 1) {
+                try std.fmt.format(
+                    stdout,
+                    "{s}\t{s}\t{s}\t{s}\t{s}\t{s} (+{d})\n",
+                    .{
+                        machine.name,
+                        target_name,
+                        model.providerName(machine.provider),
+                        model.statusName(machine.status),
+                        machine.host,
+                        tracked_workspace.remote_path,
+                        tracked_count - 1,
+                    },
+                );
+            } else {
+                try std.fmt.format(
+                    stdout,
+                    "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n",
+                    .{
+                        machine.name,
+                        target_name,
+                        model.providerName(machine.provider),
+                        model.statusName(machine.status),
+                        machine.host,
+                        tracked_workspace.remote_path,
+                    },
+                );
+            }
+        } else {
+            try std.fmt.format(
+                stdout,
+                "{s}\t{s}\t{s}\t{s}\t{s}\t-\n",
+                .{
+                    machine.name,
+                    target_name,
+                    model.providerName(machine.provider),
+                    model.statusName(machine.status),
+                    machine.host,
+                },
+            );
+        }
     }
 }
 
@@ -500,7 +565,7 @@ fn handleSync(
     }
 
     var machine = machine_ptr.*;
-    const resolved = try workspace.discover(allocator, machine.workspace);
+    const resolved = try workspace.discover(allocator, machine);
     defer resolved.deinit(allocator);
 
     try std.fmt.format(
@@ -519,7 +584,11 @@ fn handleSync(
         .sync_failed,
     );
 
-    machine.workspace = mergedWorkspaceRecord(machine, resolved, null);
+    const tracked_workspaces = try workspace.mergeTracked(allocator, machine, workspace.buildRecord(resolved, null));
+    defer tracked_workspaces.deinit(allocator);
+
+    machine.workspace = tracked_workspaces.active;
+    machine.workspaces = tracked_workspaces.records;
     machine.status = .ready;
     try state.upsertMachine(allocator, machine, null);
 
@@ -537,17 +606,17 @@ fn handlePull(
     allocator: std.mem.Allocator,
     stdout: anytype,
     stderr: anytype,
-    machine_name: []const u8,
+    command: PullCommand,
 ) !void {
     var loaded_state = try state.loadOrEmpty(allocator, null);
     defer loaded_state.deinit();
 
-    const machine_ptr = state.findMachine(&loaded_state.value, machine_name) orelse {
+    const machine_ptr = state.findMachine(&loaded_state.value, command.machine_name) orelse {
         try std.fmt.format(
             stderr,
             "[error] no tracked machine named '{s}'\n" ++
                 "[hint] run a target first so there is a machine to pull from\n",
-            .{machine_name},
+            .{command.machine_name},
         );
         return error.HandledFailure;
     };
@@ -556,53 +625,108 @@ fn handlePull(
         try std.fmt.format(
             stderr,
             "[error] machine '{s}' is being destroyed\n",
-            .{machine_name},
+            .{command.machine_name},
         );
         return error.HandledFailure;
     }
 
-    const tracked_workspace = machine_ptr.workspace orelse {
-        try std.fmt.format(
-            stderr,
-            "[error] machine '{s}' has no tracked workspace yet\n" ++
-                "[hint] run `rove sync {s}` or `rove offload {s}` first\n",
-            .{ machine_name, machine_name, machine_name },
-        );
-        return error.HandledFailure;
-    };
-
     var machine = machine_ptr.*;
-    const resolved = try workspace.fromRecord(allocator, tracked_workspace);
+    const resolved = workspace.resolvePull(allocator, machine) catch |err| switch (err) {
+        error.NoTrackedWorkspace => {
+            try std.fmt.format(
+                stderr,
+                "[error] machine '{s}' has no tracked workspace yet\n" ++
+                    "[hint] run `rove sync {s}` or `rove offload {s}` first\n",
+                .{ command.machine_name, command.machine_name, command.machine_name },
+            );
+            return error.HandledFailure;
+        },
+        else => return err,
+    };
     defer resolved.deinit(allocator);
 
-    machine.status = .pulling;
-    try state.upsertMachine(allocator, machine, null);
-
-    try std.fmt.format(
-        stdout,
-        "[info] pulling workspace from {s} to '{s}'\n",
-        .{ resolved.remote_root, resolved.local_root },
-    );
-
-    sync.pullWorkspaceFiles(allocator, machine, resolved) catch |err| {
-        machine.status = .pull_failed;
-        try state.upsertMachine(allocator, machine, null);
-
+    var preview = sync.previewPullWorkspace(allocator, machine, resolved) catch |err| {
         try std.fmt.format(
             stderr,
-            "[error] workspace pull failed for machine '{s}': {s}\n",
-            .{ machine_name, @errorName(err) },
+            "[error] workspace pull preview failed for machine '{s}': {s}\n",
+            .{ command.machine_name, @errorName(err) },
         );
         return error.HandledFailure;
     };
+    defer preview.deinit(allocator);
+    const has_changes = preview.hasChanges();
 
+    if (command.preview) {
+        try std.fmt.format(
+            stdout,
+            "[info] previewing pull from {s} to '{s}'\n",
+            .{ resolved.remote_root, resolved.local_root },
+        );
+
+        if (has_changes) {
+            try stdout.writeAll(preview.changes);
+        } else {
+            try stdout.writeAll("[info] no remote changes detected\n");
+        }
+        return;
+    }
+
+    const local_dirty = try workspace.localRepoHasUncommittedChanges(allocator, resolved.local_root);
+    if (local_dirty and has_changes and !command.force) {
+        try std.fmt.format(
+            stderr,
+            "[error] local workspace '{s}' has uncommitted git changes\n" ++
+                "[hint] run `rove pull {s} --preview` to inspect remote changes or `rove pull {s} --force` to continue\n",
+            .{ resolved.local_root, command.machine_name, command.machine_name },
+        );
+        return error.HandledFailure;
+    }
+
+    if (has_changes) {
+        try std.fmt.format(
+            stdout,
+            "[info] pulling workspace from {s} to '{s}'\n",
+            .{ resolved.remote_root, resolved.local_root },
+        );
+        if (local_dirty and command.force) {
+            try stdout.writeAll("[info] local git repo is dirty; continuing because --force was set\n");
+        }
+    } else {
+        try stdout.writeAll("[info] no remote changes detected\n");
+    }
+
+    const tracked_workspaces = try workspace.mergeTracked(allocator, machine, workspace.buildRecord(resolved, null));
+    defer tracked_workspaces.deinit(allocator);
+
+    if (has_changes) {
+        machine.status = .pulling;
+        try state.upsertMachine(allocator, machine, null);
+
+        sync.pullWorkspaceFiles(allocator, machine, resolved) catch |err| {
+            machine.status = .pull_failed;
+            try state.upsertMachine(allocator, machine, null);
+
+            try std.fmt.format(
+                stderr,
+                "[error] workspace pull failed for machine '{s}': {s}\n",
+                .{ command.machine_name, @errorName(err) },
+            );
+            return error.HandledFailure;
+        };
+    }
+
+    machine.workspace = tracked_workspaces.active;
+    machine.workspaces = tracked_workspaces.records;
     machine.status = .ready;
     try state.upsertMachine(allocator, machine, null);
 
     try std.fmt.format(
         stdout,
-        "[info] workspace pulled for machine '{s}'\n",
-        .{machine_name},
+        if (has_changes)
+            "[info] workspace pulled for machine '{s}'\n"
+        else
+            "[info] workspace already up to date for machine '{s}'\n",
+        .{command.machine_name},
     );
 }
 
@@ -635,7 +759,7 @@ fn handleOffload(
     }
 
     var machine = machine_ptr.*;
-    const resolved = try workspace.discover(allocator, machine.workspace);
+    const resolved = try workspace.discover(allocator, machine);
     defer resolved.deinit(allocator);
 
     var loaded_config: ?std.json.Parsed(model.ConfigFile) = config.load(allocator, null) catch |err| switch (err) {
@@ -691,7 +815,11 @@ fn handleOffload(
         return error.HandledFailure;
     };
 
-    machine.workspace = mergedWorkspaceRecord(machine, resolved, planned.restore.session_name);
+    const tracked_workspaces = try workspace.mergeTracked(allocator, machine, workspace.buildRecord(resolved, planned.restore.session_name));
+    defer tracked_workspaces.deinit(allocator);
+
+    machine.workspace = tracked_workspaces.active;
+    machine.workspaces = tracked_workspaces.records;
     machine.status = .ready;
     try state.upsertMachine(allocator, machine, null);
 
@@ -826,23 +954,6 @@ fn syncResolvedWorkspace(
     return result.ran_bootstrap_hook;
 }
 
-fn mergedWorkspaceRecord(
-    machine: model.MachineRecord,
-    resolved: workspace.ResolvedWorkspace,
-    tmux_session: ?[]const u8,
-) model.WorkspaceRecord {
-    return .{
-        .local_path = resolved.local_root,
-        .remote_path = resolved.remote_root,
-        .tmux_session = if (tmux_session) |session|
-            session
-        else if (machine.workspace) |existing|
-            existing.tmux_session
-        else
-            null,
-    };
-}
-
 fn isValidInstanceName(name: []const u8) bool {
     if (name.len == 0) return false;
 
@@ -900,7 +1011,24 @@ test "parse pull target" {
     const command = try parse(&.{ "pull", "sam-east" });
 
     switch (command) {
-        .pull => |name| try std.testing.expectEqualStrings("sam-east", name),
+        .pull => |pull_command| {
+            try std.testing.expectEqualStrings("sam-east", pull_command.machine_name);
+            try std.testing.expect(!pull_command.preview);
+            try std.testing.expect(!pull_command.force);
+        },
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse pull target with preview and force" {
+    const command = try parse(&.{ "pull", "sam-east", "--preview", "--force" });
+
+    switch (command) {
+        .pull => |pull_command| {
+            try std.testing.expectEqualStrings("sam-east", pull_command.machine_name);
+            try std.testing.expect(pull_command.preview);
+            try std.testing.expect(pull_command.force);
+        },
         else => return error.InvalidArguments,
     }
 }

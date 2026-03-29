@@ -4,6 +4,10 @@ const model = @import("model.zig");
 
 pub const bootstrap_hook_path = ".rove/bootstrap.sh";
 
+pub const Error = error{
+    NoTrackedWorkspace,
+};
+
 pub const ResolvedWorkspace = struct {
     local_root: []u8,
     current_dir: []u8,
@@ -18,34 +22,65 @@ pub const ResolvedWorkspace = struct {
     }
 };
 
+pub const OwnedTrackedWorkspaces = struct {
+    active: model.WorkspaceRecord,
+    records: []model.WorkspaceRecord,
+
+    pub fn deinit(self: OwnedTrackedWorkspaces, allocator: std.mem.Allocator) void {
+        allocator.free(self.records);
+    }
+};
+
+const CurrentContext = struct {
+    current_dir: []u8,
+    local_root: []u8,
+    name: []u8,
+
+    fn deinit(self: CurrentContext, allocator: std.mem.Allocator) void {
+        allocator.free(self.current_dir);
+        allocator.free(self.local_root);
+        allocator.free(self.name);
+    }
+};
+
 pub fn discover(
     allocator: std.mem.Allocator,
-    existing: ?model.WorkspaceRecord,
+    machine: model.MachineRecord,
 ) !ResolvedWorkspace {
-    const current_dir = try std.fs.cwd().realpathAlloc(allocator, ".");
-    errdefer allocator.free(current_dir);
+    var current = try currentContext(allocator);
+    errdefer current.deinit(allocator);
 
-    const local_root = try detectRepoRoot(allocator, current_dir);
-    errdefer allocator.free(local_root);
-
-    const name = try workspaceName(allocator, local_root);
-    errdefer allocator.free(name);
-
-    const remote_root = if (existing) |workspace_record|
-        if (std.mem.eql(u8, workspace_record.local_path, local_root))
-            try allocator.dupe(u8, workspace_record.remote_path)
-        else
-            try std.fmt.allocPrint(allocator, "$HOME/work/{s}", .{name})
+    const tracked = findTrackedByLocalPath(machine, current.local_root);
+    const remote_root = if (tracked) |record|
+        try allocator.dupe(u8, record.remote_path)
     else
-        try std.fmt.allocPrint(allocator, "$HOME/work/{s}", .{name});
+        try defaultRemoteRoot(allocator, machine, current.name, current.local_root);
     errdefer allocator.free(remote_root);
 
     return .{
-        .local_root = local_root,
-        .current_dir = current_dir,
+        .local_root = current.local_root,
+        .current_dir = current.current_dir,
         .remote_root = remote_root,
-        .name = name,
+        .name = current.name,
     };
+}
+
+pub fn resolvePull(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+) !ResolvedWorkspace {
+    var current = try currentContext(allocator);
+    defer current.deinit(allocator);
+
+    if (findTrackedByLocalPath(machine, current.local_root)) |tracked| {
+        return fromRecord(allocator, tracked);
+    }
+
+    if (activeTracked(machine)) |tracked| {
+        return fromRecord(allocator, tracked);
+    }
+
+    return error.NoTrackedWorkspace;
 }
 
 pub fn fromRecord(
@@ -61,7 +96,7 @@ pub fn fromRecord(
     const remote_root = try allocator.dupe(u8, existing.remote_path);
     errdefer allocator.free(remote_root);
 
-    const name = try workspaceName(allocator, existing.local_path);
+    const name = try allocator.dupe(u8, recordName(existing));
     errdefer allocator.free(name);
 
     return .{
@@ -70,6 +105,80 @@ pub fn fromRecord(
         .remote_root = remote_root,
         .name = name,
     };
+}
+
+pub fn buildRecord(
+    resolved: ResolvedWorkspace,
+    tmux_session: ?[]const u8,
+) model.WorkspaceRecord {
+    return .{
+        .name = resolved.name,
+        .local_path = resolved.local_root,
+        .remote_path = resolved.remote_root,
+        .tmux_session = tmux_session,
+    };
+}
+
+pub fn mergeTracked(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    incoming: model.WorkspaceRecord,
+) !OwnedTrackedWorkspaces {
+    var records = std.ArrayListUnmanaged(model.WorkspaceRecord){};
+    errdefer records.deinit(allocator);
+
+    if (machine.workspaces.len > 0) {
+        try records.appendSlice(allocator, machine.workspaces);
+    }
+
+    if (machine.workspace) |active| {
+        upsertRecord(allocator, &records, active);
+    }
+
+    upsertRecord(allocator, &records, incoming);
+
+    return .{
+        .active = resolvedRecord(records.items, incoming.local_path).?,
+        .records = try records.toOwnedSlice(allocator),
+    };
+}
+
+pub fn activeTracked(machine: model.MachineRecord) ?model.WorkspaceRecord {
+    if (machine.workspace) |record| return record;
+    if (machine.workspaces.len > 0) return machine.workspaces[0];
+    return null;
+}
+
+pub fn findTrackedByLocalPath(
+    machine: model.MachineRecord,
+    local_root: []const u8,
+) ?model.WorkspaceRecord {
+    if (machine.workspace) |record| {
+        if (std.mem.eql(u8, record.local_path, local_root)) return record;
+    }
+
+    for (machine.workspaces) |record| {
+        if (std.mem.eql(u8, record.local_path, local_root)) return record;
+    }
+
+    return null;
+}
+
+pub fn trackedCount(machine: model.MachineRecord) usize {
+    if (machine.workspaces.len > 0) return machine.workspaces.len;
+    if (machine.workspace != null) return 1;
+    return 0;
+}
+
+pub fn recordName(record: model.WorkspaceRecord) []const u8 {
+    if (record.name) |name| {
+        if (name.len > 0) return name;
+    }
+
+    const base = std.fs.path.basename(record.local_path);
+    if (base.len > 0) return base;
+
+    return std.fs.path.basename(record.remote_path);
 }
 
 pub fn mapLocalPath(
@@ -131,6 +240,123 @@ pub fn localBootstrapHookPath(
     };
 
     return hook_path;
+}
+
+pub fn localRepoHasUncommittedChanges(
+    allocator: std.mem.Allocator,
+    local_root: []const u8,
+) !bool {
+    const result = exec.run(allocator, &.{
+        "git",
+        "-C",
+        local_root,
+        "status",
+        "--porcelain",
+    }) catch {
+        return false;
+    };
+    defer result.deinit(allocator);
+
+    if (!result.succeeded()) {
+        return false;
+    }
+
+    return std.mem.trim(u8, result.stdout, "\r\n\t ").len > 0;
+}
+
+fn currentContext(
+    allocator: std.mem.Allocator,
+) !CurrentContext {
+    const current_dir = try std.fs.cwd().realpathAlloc(allocator, ".");
+    errdefer allocator.free(current_dir);
+
+    const local_root = try detectRepoRoot(allocator, current_dir);
+    errdefer allocator.free(local_root);
+
+    const name = try workspaceName(allocator, local_root);
+    errdefer allocator.free(name);
+
+    return .{
+        .current_dir = current_dir,
+        .local_root = local_root,
+        .name = name,
+    };
+}
+
+fn defaultRemoteRoot(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    name: []const u8,
+    local_root: []const u8,
+) ![]u8 {
+    const base = try std.fmt.allocPrint(allocator, "$HOME/work/{s}", .{name});
+    errdefer allocator.free(base);
+
+    if (!remotePathInUse(machine, base, local_root)) {
+        return base;
+    }
+
+    allocator.free(base);
+    const suffix: u32 = @truncate(std.hash.Wyhash.hash(0, local_root));
+    return std.fmt.allocPrint(allocator, "$HOME/work/{s}-{x}", .{ name, suffix });
+}
+
+fn remotePathInUse(
+    machine: model.MachineRecord,
+    candidate: []const u8,
+    local_root: []const u8,
+) bool {
+    if (machine.workspace) |record| {
+        if (std.mem.eql(u8, record.remote_path, candidate) and !std.mem.eql(u8, record.local_path, local_root)) {
+            return true;
+        }
+    }
+
+    for (machine.workspaces) |record| {
+        if (std.mem.eql(u8, record.remote_path, candidate) and !std.mem.eql(u8, record.local_path, local_root)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+fn resolvedRecord(
+    records: []const model.WorkspaceRecord,
+    local_path: []const u8,
+) ?model.WorkspaceRecord {
+    for (records) |record| {
+        if (std.mem.eql(u8, record.local_path, local_path)) return record;
+    }
+
+    return null;
+}
+
+fn upsertRecord(
+    allocator: std.mem.Allocator,
+    records: *std.ArrayListUnmanaged(model.WorkspaceRecord),
+    incoming: model.WorkspaceRecord,
+) void {
+    for (records.items) |*existing| {
+        if (!std.mem.eql(u8, existing.local_path, incoming.local_path)) continue;
+
+        existing.* = mergeRecord(existing.*, incoming);
+        return;
+    }
+
+    records.append(allocator, incoming) catch unreachable;
+}
+
+fn mergeRecord(
+    existing: model.WorkspaceRecord,
+    incoming: model.WorkspaceRecord,
+) model.WorkspaceRecord {
+    return .{
+        .name = incoming.name orelse existing.name,
+        .local_path = incoming.local_path,
+        .remote_path = incoming.remote_path,
+        .tmux_session = incoming.tmux_session orelse existing.tmux_session,
+    };
 }
 
 fn detectRepoRoot(
@@ -270,4 +496,50 @@ test "detect repo-local bootstrap hook" {
     defer allocator.free(hook_path);
 
     try std.testing.expect(std.mem.endsWith(u8, hook_path, ".rove/bootstrap.sh"));
+}
+
+test "merge tracked workspaces preserves older tmux session" {
+    const allocator = std.testing.allocator;
+    const tracked = try mergeTracked(allocator, .{
+        .name = "devbox",
+        .provider = .fly,
+        .id = "machine-1",
+        .host = "devbox.fly.dev",
+        .ssh_user = "root",
+        .workspace = .{
+            .name = "project",
+            .local_path = "/tmp/project",
+            .remote_path = "$HOME/work/project",
+            .tmux_session = "main",
+        },
+        .status = .ready,
+    }, .{
+        .name = "project",
+        .local_path = "/tmp/project",
+        .remote_path = "$HOME/work/project",
+    });
+    defer tracked.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), tracked.records.len);
+    try std.testing.expectEqualStrings("main", tracked.active.tmux_session.?);
+}
+
+test "default remote root adds suffix when basename collides" {
+    const allocator = std.testing.allocator;
+    const remote_root = try defaultRemoteRoot(allocator, .{
+        .name = "devbox",
+        .provider = .fly,
+        .id = "machine-1",
+        .host = "devbox.fly.dev",
+        .ssh_user = "root",
+        .workspaces = &.{.{
+            .name = "project",
+            .local_path = "/tmp/project",
+            .remote_path = "$HOME/work/project",
+        }},
+        .status = .ready,
+    }, "project", "/tmp/other/project");
+    defer allocator.free(remote_root);
+
+    try std.testing.expect(std.mem.startsWith(u8, remote_root, "$HOME/work/project-"));
 }
