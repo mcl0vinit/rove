@@ -1,7 +1,6 @@
 FROM ghcr.io/nixos/nix:latest
 
 ENV PATH=/nix/var/nix/profiles/default/bin:/root/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin
-ENV NIX_CONFIG="experimental-features = nix-command flakes\naccept-flake-config = true"
 
 WORKDIR /opt/rove-devbox
 
@@ -12,7 +11,7 @@ RUN mkdir -p /etc/nix \
       'experimental-features = nix-command flakes' \
       'accept-flake-config = true' \
       > /etc/nix/nix.conf \
-    && nix profile install --accept-flake-config .#default \
+    && nix --extra-experimental-features 'nix-command flakes' profile add --priority 4 --accept-flake-config .#default \
     && nix store gc
 
 COPY sshd_config /etc/ssh/sshd_config

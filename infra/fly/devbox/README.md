@@ -42,23 +42,23 @@ Language runtimes should come from each project's own flake.
 
 ## Initial setup
 
-1. The app name in `fly.toml` is already set to `devbox`.
+1. The app name in `fly.toml` is already set to `mcl0vinit-devbox`.
 2. Create the app:
 
 ```bash
-fly apps create devbox
+fly apps create mcl0vinit-devbox
 ```
 
 3. Set your SSH public key as a secret:
 
 ```bash
-fly secrets set AUTHORIZED_KEYS="$(cat ~/.ssh/id_ed25519.pub)" --app devbox
+fly secrets set AUTHORIZED_KEYS="$(cat ~/.ssh/id_ed25519.pub)" --app mcl0vinit-devbox
 ```
 
 4. If you want normal public `ssh` / `scp` / `rsync`, allocate a dedicated IPv4:
 
 ```bash
-fly ips allocate-v4 --app devbox
+fly ips allocate-v4 --app mcl0vinit-devbox
 ```
 
 5. Deploy the image.
@@ -72,7 +72,7 @@ fly deploy --region <closest-region>
 6. Optional: create a volume only if you want region stickiness more than roaming placement:
 
 ```bash
-fly volumes create data --app devbox --region <your-region> --size 20
+fly volumes create data --app mcl0vinit-devbox --region <your-region> --size 20
 ```
 
 7. If you create that volume, uncomment the mount in `fly.toml`.
@@ -110,7 +110,7 @@ fly deploy
 If you allocated a dedicated IPv4, you can connect with:
 
 ```bash
-ssh root@devbox.fly.dev
+ssh root@mcl0vinit-devbox.fly.dev
 ```
 
 ### Fly console / Fly SSH
@@ -118,7 +118,7 @@ ssh root@devbox.fly.dev
 If you skip public raw SSH for now, Fly's own access path still works:
 
 ```bash
-fly ssh console --app devbox
+fly ssh console --app mcl0vinit-devbox
 ```
 
 ## Notes
@@ -136,8 +136,8 @@ When we wire this into `rove.json`, a Fly CPU target will probably look roughly 
 {
   "name": "devbox",
   "provider": "fly",
-  "app": "devbox",
-  "image": "registry.fly.io/devbox:deployment-<id>",
+  "app": "mcl0vinit-devbox",
+  "image": "registry.fly.io/mcl0vinit-devbox:deployment-<id>",
   "vm_size": "shared-cpu-2x",
   "ssh_user": "root",
   "startup_script": "./scripts/bootstrap.sh",
