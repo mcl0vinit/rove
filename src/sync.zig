@@ -13,9 +13,13 @@ const default_excludes = [_][]const u8{
     ".zig-cache/",
     "zig-cache/",
     "zig-out/",
+    "result",
+    "result-*",
     "node_modules/",
     "dist/",
 };
+
+const remote_rsync_binary = "/usr/local/bin/rsync";
 
 const RsyncOptions = struct {
     dry_run: bool = false,
@@ -70,7 +74,7 @@ pub fn pushWorkspaceFiles(
     const source = try std.fmt.allocPrint(allocator, "{s}/", .{resolved.local_root});
     defer allocator.free(source);
 
-    const remote_path = try workspace.quoteRemotePath(allocator, resolved.remote_root);
+    const remote_path = try rsyncRemotePath(allocator, machine, resolved.remote_root);
     defer allocator.free(remote_path);
 
     const destination = try std.fmt.allocPrint(
@@ -99,7 +103,7 @@ pub fn previewSyncWorkspace(
     const source = try std.fmt.allocPrint(allocator, "{s}/", .{resolved.local_root});
     defer allocator.free(source);
 
-    const remote_path = try workspace.quoteRemotePath(allocator, resolved.remote_root);
+    const remote_path = try rsyncRemotePath(allocator, machine, resolved.remote_root);
     defer allocator.free(remote_path);
 
     const destination = try std.fmt.allocPrint(
@@ -250,7 +254,7 @@ fn pullSourceSpec(
     machine: model.MachineRecord,
     remote_root: []const u8,
 ) ![]u8 {
-    const remote_path = try workspace.quoteRemotePath(allocator, remote_root);
+    const remote_path = try rsyncRemotePath(allocator, machine, remote_root);
     defer allocator.free(remote_path);
 
     return std.fmt.allocPrint(
@@ -258,6 +262,59 @@ fn pullSourceSpec(
         "{s}@{s}:{s}/",
         .{ machine.ssh_user, machine.host, remote_path },
     );
+}
+
+fn rsyncRemotePath(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    remote_path: []const u8,
+) ![]u8 {
+    const resolved_path = try resolveRemoteHomePath(allocator, machine, remote_path);
+    defer allocator.free(resolved_path);
+
+    return escapeRemoteSpecPath(allocator, resolved_path);
+}
+
+fn resolveRemoteHomePath(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    remote_path: []const u8,
+) ![]u8 {
+    if (!std.mem.startsWith(u8, remote_path, "$HOME")) {
+        return allocator.dupe(u8, remote_path);
+    }
+
+    const home = if (std.mem.eql(u8, machine.ssh_user, "root"))
+        "/root"
+    else
+        try std.fmt.allocPrint(allocator, "/home/{s}", .{machine.ssh_user});
+    defer if (!std.mem.eql(u8, machine.ssh_user, "root")) allocator.free(home);
+
+    if (remote_path.len == "$HOME".len) {
+        return allocator.dupe(u8, home);
+    }
+
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ home, remote_path["$HOME".len..] });
+}
+
+fn escapeRemoteSpecPath(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    for (raw) |char| {
+        switch (char) {
+            ' ', '\t', '\n', '\\', '"', '\'', '$', '`', '!', '&', '(', ')', ';', '<', '>', '?', '[', ']', '{', '}', '|' => {
+                try writer.writer.writeByte('\\');
+                try writer.writer.writeByte(char);
+            },
+            else => try writer.writer.writeByte(char),
+        }
+    }
+
+    return allocator.dupe(u8, writer.written());
 }
 
 fn runRsync(
@@ -273,7 +330,7 @@ fn runRsync(
     var args = std.ArrayListUnmanaged([]const u8){};
     defer args.deinit(allocator);
 
-    try args.appendSlice(allocator, &.{ "rsync", "-az", "-e", transport });
+    try args.appendSlice(allocator, &.{ "rsync", "-az", "-e", transport, "--rsync-path", remote_rsync_binary });
     if (options.dry_run) {
         try args.append(allocator, "--dry-run");
     }
@@ -328,6 +385,44 @@ test "preview reports changes when rsync itemized output is non-empty" {
     };
 
     try std.testing.expect(preview.hasChanges());
+}
+
+test "resolve remote home path expands HOME for non-root users" {
+    const allocator = std.testing.allocator;
+    const resolved = try resolveRemoteHomePath(allocator, .{
+        .name = "smoke",
+        .provider = .fly,
+        .id = "machine-id",
+        .host = "example.fly.dev",
+        .ssh_user = "rove",
+        .status = .ready,
+    }, "$HOME/work/project");
+    defer allocator.free(resolved);
+
+    try std.testing.expectEqualStrings("/home/rove/work/project", resolved);
+}
+
+test "resolve remote home path expands HOME for root" {
+    const allocator = std.testing.allocator;
+    const resolved = try resolveRemoteHomePath(allocator, .{
+        .name = "smoke",
+        .provider = .fly,
+        .id = "machine-id",
+        .host = "example.fly.dev",
+        .ssh_user = "root",
+        .status = .ready,
+    }, "$HOME/work/project");
+    defer allocator.free(resolved);
+
+    try std.testing.expectEqualStrings("/root/work/project", resolved);
+}
+
+test "escape remote spec path escapes shell metacharacters without wrapping quotes" {
+    const allocator = std.testing.allocator;
+    const escaped = try escapeRemoteSpecPath(allocator, "/home/rove/work/my repo");
+    defer allocator.free(escaped);
+
+    try std.testing.expectEqualStrings("/home/rove/work/my\\ repo", escaped);
 }
 
 test "preview reports no changes for whitespace-only output" {
