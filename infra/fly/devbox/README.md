@@ -1,11 +1,12 @@
 # Fly Devbox
 
-This directory defines the first Fly-based Rove substrate: a small CPU devbox image with Nix, SSH, and a deliberately boring toolbox.
+This directory defines the first Fly-based Rove substrate: a small CPU devbox image with Nix, SSH, and your baked-in `portable-linux` dotfiles baseline.
 
 ## What this image is for
 
-- boot a plain remote machine quickly
+- boot a ready-to-use remote machine quickly
 - let project-specific flakes define language runtimes and app dependencies
+- keep your portable shell, tmux, and editor defaults in the image instead of replaying Home Manager on every boot
 - keep the base image focused on remote-dev primitives:
   - `nix`
   - `git`
@@ -35,7 +36,7 @@ Language runtimes should come from each project's own flake.
 ## Files
 
 - `flake.nix`: declarative package set for the base image
-- `Dockerfile`: builds on the official Nix container image
+- `Dockerfile`: builds on Debian, layers a single-user Nix install on top, and applies the pinned dotfiles baseline during image build
 - `entrypoint.sh`: prepares SSH keys and starts `sshd`
 - `sshd_config`: raw SSH service on internal port `2222`
 - `fly.toml`: starter app config for a CPU-only Fly app
@@ -103,6 +104,8 @@ You can still use plain deploy for image iteration:
 fly deploy
 ```
 
+The image is pinned to a specific dotfiles commit in `Dockerfile` via `DOTFILES_REF`. When you want a newer baseline baked in, update that ref and rebuild the image.
+
 ## Access modes
 
 ### Normal SSH
@@ -110,7 +113,7 @@ fly deploy
 If you allocated a dedicated IPv4, you can connect with:
 
 ```bash
-ssh root@mcl0vinit-devbox.fly.dev
+ssh rove@mcl0vinit-devbox.fly.dev
 ```
 
 ### Fly console / Fly SSH
@@ -126,11 +129,11 @@ fly ssh console --app mcl0vinit-devbox
 - Fly's SSH-server guide recommends running your own `sshd` on internal port `2222`, not `22`.
 - Raw public SSH is a non-HTTP TCP service. Fly documents dedicated IPv4 as the normal option unless every client will use IPv6.
 - The volume mount is optional. If present, the entrypoint will reuse SSH host keys from `/persist/ssh`, but that also makes the box region-bound.
-- The devbox starts as `root` on purpose for now. That keeps the first bootstrap path simple.
+- The login user is `rove`, with passwordless `sudo`, while the entrypoint stays root-owned so it can manage host keys and `sshd`.
 
 ## Likely Rove target shape later
 
-When we wire this into `rove.json`, a Fly CPU target will probably look roughly like:
+The default `devbox` target now assumes dotfiles are already in the image, so it stays lean:
 
 ```json
 {
@@ -139,12 +142,7 @@ When we wire this into `rove.json`, a Fly CPU target will probably look roughly 
   "app": "mcl0vinit-devbox",
   "image": "registry.fly.io/mcl0vinit-devbox:deployment-<id>",
   "vm_size": "shared-cpu-2x",
-  "ssh_user": "root",
-  "startup_script": "./scripts/bootstrap.sh",
-  "profile": {
-    "repo": "https://github.com/mcl0vinit/dotfiles.git",
-    "ref": "main",
-    "install_command": "./bin/bootstrap --apply"
-  }
+  "ssh_user": "rove",
+  "startup_script": "./scripts/bootstrap.sh"
 }
 ```

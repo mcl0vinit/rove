@@ -542,7 +542,7 @@ test "merge tracked workspaces preserves older tmux session" {
         .provider = .fly,
         .id = "machine-1",
         .host = "devbox.fly.dev",
-        .ssh_user = "root",
+        .ssh_user = "rove",
         .workspace = .{
             .name = "project",
             .local_path = "/tmp/project",
@@ -568,7 +568,7 @@ test "default remote root adds suffix when basename collides" {
         .provider = .fly,
         .id = "machine-1",
         .host = "devbox.fly.dev",
-        .ssh_user = "root",
+        .ssh_user = "rove",
         .workspaces = &.{.{
             .name = "project",
             .local_path = "/tmp/project",
@@ -587,7 +587,7 @@ test "resolve tracked selector by local path" {
         .provider = .fly,
         .id = "machine-1",
         .host = "devbox.fly.dev",
-        .ssh_user = "root",
+        .ssh_user = "rove",
         .workspaces = &.{.{
             .name = "project",
             .local_path = "/tmp/project",
@@ -605,7 +605,7 @@ test "resolve tracked selector rejects ambiguous labels" {
         .provider = .fly,
         .id = "machine-1",
         .host = "devbox.fly.dev",
-        .ssh_user = "root",
+        .ssh_user = "rove",
         .workspaces = &.{
             .{
                 .name = "project",

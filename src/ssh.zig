@@ -13,11 +13,13 @@ const ConnectionParts = struct {
     destination: []u8,
     user_known_hosts: []u8,
     host_key_alias: []u8,
+    identity_file: []u8,
 
     fn deinit(self: ConnectionParts, allocator: std.mem.Allocator) void {
         allocator.free(self.destination);
         allocator.free(self.user_known_hosts);
         allocator.free(self.host_key_alias);
+        allocator.free(self.identity_file);
     }
 };
 
@@ -69,12 +71,14 @@ pub fn runBatchCommand(
 ) !exec.Result {
     const connection = try prepareConnection(allocator, machine);
     defer connection.deinit(allocator);
+    const wrapped_command = try wrappedRemoteCommand(allocator, remote_command);
+    defer allocator.free(wrapped_command);
 
     var args = std.ArrayListUnmanaged([]const u8){};
     defer args.deinit(allocator);
 
     try appendCommonArgs(allocator, &args, connection, true, true);
-    try args.appendSlice(allocator, &.{ "-T", connection.destination, remote_command });
+    try args.appendSlice(allocator, &.{ "-T", connection.destination, wrapped_command });
 
     return exec.run(allocator, args.items);
 }
@@ -137,13 +141,15 @@ pub fn openInteractiveCommand(
 ) !std.process.Child.Term {
     const connection = try prepareConnection(allocator, machine);
     defer connection.deinit(allocator);
+    const wrapped_command = try wrappedRemoteCommand(allocator, remote_command);
+    defer allocator.free(wrapped_command);
 
     var args = std.ArrayListUnmanaged([]const u8){};
     defer args.deinit(allocator);
 
     try args.append(allocator, "ssh");
     try appendOpenSshOptions(allocator, &args, connection, false, false);
-    try args.appendSlice(allocator, &.{ "-t", connection.destination, remote_command });
+    try args.appendSlice(allocator, &.{ "-t", connection.destination, wrapped_command });
 
     return exec.runInteractive(allocator, args.items);
 }
@@ -157,6 +163,10 @@ pub fn rsyncTransportCommand(
 
     const parts = [_][]const u8{
         "ssh",
+        "-i",
+        connection.identity_file,
+        "-o",
+        "IdentitiesOnly=yes",
         "-o",
         "BatchMode=yes",
         "-o",
@@ -214,10 +224,14 @@ fn prepareConnection(
     });
     errdefer allocator.free(host_key_alias);
 
+    const identity_file = try paths.defaultManagedPrivateKeyPath(allocator);
+    errdefer allocator.free(identity_file);
+
     return .{
         .destination = destination,
         .user_known_hosts = user_known_hosts,
         .host_key_alias = host_key_alias,
+        .identity_file = identity_file,
     };
 }
 
@@ -232,6 +246,23 @@ fn appendCommonArgs(
     try appendOpenSshOptions(allocator, args, connection, batch_mode, quiet);
 }
 
+fn wrappedRemoteCommand(
+    allocator: std.mem.Allocator,
+    remote_command: []const u8,
+) ![]u8 {
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "export PATH=\"$HOME/.local/share/rove/devbox-profile/bin:$HOME/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {s}",
+        .{remote_command},
+    );
+    defer allocator.free(script);
+
+    const quoted = try shell.quote(allocator, script);
+    defer allocator.free(quoted);
+
+    return std.fmt.allocPrint(allocator, "/bin/bash -lc {s}", .{quoted});
+}
+
 fn appendOpenSshOptions(
     allocator: std.mem.Allocator,
     args: *std.ArrayListUnmanaged([]const u8),
@@ -244,6 +275,10 @@ fn appendOpenSshOptions(
     }
 
     try args.appendSlice(allocator, &.{
+        "-i",
+        connection.identity_file,
+        "-o",
+        "IdentitiesOnly=yes",
         "-o",
         "PreferredAuthentications=publickey",
         "-o",

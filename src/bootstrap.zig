@@ -42,7 +42,7 @@ test "remote script path uses machine id" {
         .provider = .fly,
         .id = "machine-123",
         .host = "devbox.fly.dev",
-        .ssh_user = "root",
+        .ssh_user = "rove",
         .status = .ready,
     };
 

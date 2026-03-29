@@ -129,7 +129,7 @@ test "parse and resolve target" {
         \\      "app": "devbox",
         \\      "image": "registry.fly.io/devbox:latest",
         \\      "vm_size": "shared-cpu-2x",
-        \\      "ssh_user": "root",
+        \\      "ssh_user": "rove",
         \\      "startup_script": "./scripts/bootstrap.sh"
         \\    }
         \\  ]
@@ -157,7 +157,7 @@ test "reject duplicate target names" {
         \\      "app": "devbox",
         \\      "image": "registry.fly.io/devbox:latest",
         \\      "vm_size": "shared-cpu-2x",
-        \\      "ssh_user": "root",
+        \\      "ssh_user": "rove",
         \\      "startup_script": "./scripts/bootstrap.sh"
         \\    },
         \\    {
@@ -166,7 +166,7 @@ test "reject duplicate target names" {
         \\      "app": "devbox",
         \\      "image": "registry.fly.io/devbox:latest",
         \\      "vm_size": "shared-cpu-2x",
-        \\      "ssh_user": "root",
+        \\      "ssh_user": "rove",
         \\      "startup_script": "./scripts/bootstrap.sh"
         \\    }
         \\  ]
@@ -192,7 +192,7 @@ test "parse target with profile" {
         \\      "app": "devbox",
         \\      "image": "registry.fly.io/devbox:latest",
         \\      "vm_size": "shared-cpu-2x",
-        \\      "ssh_user": "root",
+        \\      "ssh_user": "rove",
         \\      "startup_script": "./scripts/bootstrap.sh",
         \\      "profile": {
         \\        "repo": "git@github.com:example/dotfiles.git",
@@ -226,7 +226,7 @@ test "parse target with auto tmux hook" {
         \\      "app": "devbox",
         \\      "image": "registry.fly.io/devbox:latest",
         \\      "vm_size": "shared-cpu-2x",
-        \\      "ssh_user": "root",
+        \\      "ssh_user": "rove",
         \\      "startup_script": "./scripts/bootstrap.sh",
         \\      "tmux": {
         \\        "backend": "auto",
@@ -258,7 +258,7 @@ test "reject tmux hook config without capture script" {
         \\      "app": "devbox",
         \\      "image": "registry.fly.io/devbox:latest",
         \\      "vm_size": "shared-cpu-2x",
-        \\      "ssh_user": "root",
+        \\      "ssh_user": "rove",
         \\      "startup_script": "./scripts/bootstrap.sh",
         \\      "tmux": {
         \\        "backend": "hook"

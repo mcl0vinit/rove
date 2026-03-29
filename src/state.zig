@@ -149,7 +149,7 @@ test "find machine by name" {
         \\      "provider": "fly",
         \\      "id": "machine-1",
         \\      "host": "devbox.fly.dev",
-        \\      "ssh_user": "root",
+        \\      "ssh_user": "rove",
         \\      "status": "ready"
         \\    }
         \\  ]
@@ -182,7 +182,7 @@ test "upsert and remove machine in saved state" {
         .id = "machine-1",
         .app = "devbox",
         .host = "devbox.fly.dev",
-        .ssh_user = "root",
+        .ssh_user = "rove",
         .status = .provisioned,
     }, state_path);
 

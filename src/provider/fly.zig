@@ -1,5 +1,6 @@
 const std = @import("std");
 const exec = @import("../exec.zig");
+const keys = @import("../keys.zig");
 const model = @import("../model.zig");
 const provider = @import("mod.zig");
 
@@ -9,6 +10,9 @@ pub fn create(
 ) !provider.CreateResult {
     const machine_name = try generatedMachineName(allocator, request.instance_name);
     defer allocator.free(machine_name);
+
+    const managed_key = try keys.ensureManagedKeyPair(allocator);
+    defer managed_key.deinit(allocator);
 
     var args = std.ArrayListUnmanaged([]const u8){};
     defer args.deinit(allocator);
@@ -43,6 +47,11 @@ pub fn create(
     const instance_metadata = try std.fmt.allocPrint(allocator, "rove_instance={s}", .{request.instance_name});
     defer allocator.free(instance_metadata);
     try args.append(allocator, instance_metadata);
+
+    try args.append(allocator, "--env");
+    const authorized_keys_env = try std.fmt.allocPrint(allocator, "ROVE_AUTHORIZED_KEYS={s}", .{managed_key.public_key});
+    defer allocator.free(authorized_keys_env);
+    try args.append(allocator, authorized_keys_env);
 
     if (selectedRegion(request.target.*)) |region| {
         try args.appendSlice(allocator, &.{ "--region", region });
@@ -267,6 +276,7 @@ fn findListedMachine(
 ) !?FoundMachine {
     var parsed = try std.json.parseFromSlice([]const ListedMachine, allocator, json_slice, .{
         .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
 
@@ -298,7 +308,7 @@ test "select fixed region first" {
         .vm_size = "shared-cpu-2x",
         .region = "ord",
         .region_preference = &.{ "iad", "dfw" },
-        .ssh_user = "root",
+        .ssh_user = "rove",
         .startup_script = "./scripts/bootstrap.sh",
     };
 
@@ -313,7 +323,7 @@ test "select first preferred region when fixed region is absent" {
         .image = "registry.fly.io/devbox:latest",
         .vm_size = "shared-cpu-2x",
         .region_preference = &.{ "iad", "dfw" },
-        .ssh_user = "root",
+        .ssh_user = "rove",
         .startup_script = "./scripts/bootstrap.sh",
     };
 
@@ -326,4 +336,29 @@ test "machine name slug normalizes instance names" {
     defer allocator.free(slug);
 
     try std.testing.expectEqualStrings("devbox-sam-work", slug);
+}
+
+test "listed machine parsing ignores extra fly fields" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\[
+        \\  {
+        \\    "id": "123",
+        \\    "name": "rove-smoke",
+        \\    "state": "started",
+        \\    "region": "iad",
+        \\    "private_ip": "fdaa::1",
+        \\    "config": {
+        \\      "image": "registry.fly.io/example:latest"
+        \\    }
+        \\  }
+        \\]
+    ;
+
+    const found = try findListedMachine(allocator, json, .name, "rove-smoke");
+    defer if (found) |machine| machine.deinit(allocator);
+
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("123", found.?.id.?);
+    try std.testing.expectEqualStrings("iad", found.?.region.?);
 }

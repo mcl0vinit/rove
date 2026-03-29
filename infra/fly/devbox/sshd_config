@@ -5,13 +5,14 @@ ListenAddress 0.0.0.0
 ListenAddress ::
 HostKey /etc/ssh/ssh_host_ed25519_key
 HostKey /etc/ssh/ssh_host_rsa_key
-PermitRootLogin yes
+PermitRootLogin no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 UsePAM no
 PubkeyAuthentication yes
 AuthorizedKeysFile .ssh/authorized_keys
+AllowUsers rove
 PermitTTY yes
 AllowAgentForwarding yes
 AllowTcpForwarding yes
@@ -19,5 +20,6 @@ X11Forwarding no
 ClientAliveInterval 30
 ClientAliveCountMax 120
 PrintMotd no
-Subsystem sftp /nix/var/nix/profiles/default/libexec/sftp-server
+LogLevel VERBOSE
+Subsystem sftp internal-sftp
 PidFile /var/run/sshd.pid

@@ -24,3 +24,17 @@ pub fn defaultKnownHostsPath(allocator: std.mem.Allocator) ![]u8 {
 
     return std.fmt.allocPrint(allocator, "{s}/known_hosts", .{state_dir});
 }
+
+pub fn defaultManagedPrivateKeyPath(allocator: std.mem.Allocator) ![]u8 {
+    const state_dir = try defaultStateDir(allocator);
+    defer allocator.free(state_dir);
+
+    return std.fmt.allocPrint(allocator, "{s}/id_ed25519", .{state_dir});
+}
+
+pub fn defaultManagedPublicKeyPath(allocator: std.mem.Allocator) ![]u8 {
+    const private_key_path = try defaultManagedPrivateKeyPath(allocator);
+    defer allocator.free(private_key_path);
+
+    return std.fmt.allocPrint(allocator, "{s}.pub", .{private_key_path});
+}

@@ -2,7 +2,7 @@ app = "mcl0vinit-devbox"
 # Intentionally no `primary_region`.
 # For Rove-managed Machines, the better default is to let Fly place each
 # Machine close to where the command is run unless the target pins a region.
-console_command = "/nix/var/nix/profiles/default/bin/bash"
+console_command = "/bin/bash"
 
 [build]
   dockerfile = "Dockerfile"
