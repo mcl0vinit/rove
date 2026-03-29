@@ -31,14 +31,20 @@ pub const PullCommand = struct {
     workspace_selector: ?[]const u8 = null,
 };
 
+pub const WorkspaceTargetCommand = struct {
+    machine_name: []const u8,
+    workspace_selector: ?[]const u8 = null,
+};
+
 pub const Command = union(enum) {
     help,
     status,
     run: RunCommand,
     sync: []const u8,
     pull: PullCommand,
-    offload: []const u8,
-    ssh: []const u8,
+    workspaces: []const u8,
+    offload: WorkspaceTargetCommand,
+    ssh: WorkspaceTargetCommand,
     down: []const u8,
 };
 
@@ -59,10 +65,11 @@ pub fn run(
 
     switch (command) {
         .help => try printHelp(stdout),
-        .status => try handleStatus(allocator, stdout),
+        .status => try handleStatus(allocator, stdout, stderr),
         .run => |target| try handleRun(allocator, stdout, stderr, target),
         .sync => |target| try handleSync(allocator, stdout, stderr, target),
         .pull => |pull_command| try handlePull(allocator, stdout, stderr, pull_command),
+        .workspaces => |machine_name| try handleWorkspaces(allocator, stdout, stderr, machine_name),
         .offload => |target| try handleOffload(allocator, stdout, stderr, target),
         .ssh => |target| try handleSsh(allocator, stdout, stderr, target),
         .down => |target| try handleDown(allocator, stdout, target),
@@ -89,12 +96,16 @@ pub fn parse(args: []const []const u8) ParseError!Command {
         return .{ .pull = try parsePullCommand(args) };
     }
 
+    if (std.mem.eql(u8, args[0], "workspaces")) {
+        return .{ .workspaces = try expectSingleTarget(args) };
+    }
+
     if (std.mem.eql(u8, args[0], "ssh")) {
-        return .{ .ssh = try expectSingleTarget(args) };
+        return .{ .ssh = try parseWorkspaceTargetCommand(args) };
     }
 
     if (std.mem.eql(u8, args[0], "offload")) {
-        return .{ .offload = try expectSingleTarget(args) };
+        return .{ .offload = try parseWorkspaceTargetCommand(args) };
     }
 
     if (std.mem.eql(u8, args[0], "down")) {
@@ -180,6 +191,31 @@ fn parsePullCommand(args: []const []const u8) ParseError!PullCommand {
     return command;
 }
 
+fn parseWorkspaceTargetCommand(args: []const []const u8) ParseError!WorkspaceTargetCommand {
+    if (args.len < 2) return error.InvalidArguments;
+    if (args[1].len == 0) return error.InvalidArguments;
+
+    var command = WorkspaceTargetCommand{
+        .machine_name = args[1],
+    };
+
+    var index: usize = 2;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--workspace")) {
+            if (command.workspace_selector != null) return error.InvalidArguments;
+            if (index + 1 >= args.len) return error.InvalidArguments;
+            if (args[index + 1].len == 0) return error.InvalidArguments;
+            command.workspace_selector = args[index + 1];
+            index += 2;
+            continue;
+        }
+
+        return error.InvalidArguments;
+    }
+
+    return command;
+}
+
 pub fn printHelp(writer: anytype) !void {
     try writer.writeAll(
         \\rove
@@ -188,9 +224,10 @@ pub fn printHelp(writer: anytype) !void {
         \\  rove run <target> [--name <name>]
         \\  rove sync <name>
         \\  rove pull <name> [--workspace <label-or-path>] [--preview] [--force]
-        \\  rove offload <name>
+        \\  rove workspaces <name>
+        \\  rove offload <name> [--workspace <label-or-path>]
         \\  rove status
-        \\  rove ssh <name>
+        \\  rove ssh <name> [--workspace <label-or-path>]
         \\  rove down <name>
         \\
         \\This scaffold matches the handoff's first milestone:
@@ -200,8 +237,9 @@ pub fn printHelp(writer: anytype) !void {
         \\  4. sync a workspace and run repo-local bootstrap
         \\  5. offload a workspace into tmux
         \\  6. pull changes back
-        \\  7. SSH into it
-        \\  8. tear it down cleanly
+        \\  7. inspect tracked workspaces
+        \\  8. SSH into it
+        \\  9. tear it down cleanly
         \\
         \\Defaults:
         \\  config: ./rove.json
@@ -211,8 +249,9 @@ pub fn printHelp(writer: anytype) !void {
         \\  `run` takes a target from rove.json
         \\  `--name` chooses the tracked instance name
         \\  if omitted, the target name is used
-        \\  `sync`, `pull`, `offload`, `ssh`, and `down` address the tracked instance name
+        \\  `sync`, `pull`, `workspaces`, `offload`, `ssh`, and `down` address the tracked instance name
         \\  `pull --workspace` selects one tracked workspace by label, local path, or remote path
+        \\  `ssh --workspace` and `offload --workspace` reuse a specific tracked workspace
         \\  `pull --preview` shows rsync changes without writing local files
         \\  `pull` refuses to overwrite a dirty local git repo unless `--force` is set
         \\
@@ -222,6 +261,7 @@ pub fn printHelp(writer: anytype) !void {
 fn handleStatus(
     allocator: std.mem.Allocator,
     stdout: anytype,
+    stderr: anytype,
 ) !void {
     var loaded_state = try state.loadOrEmpty(allocator, null);
     defer loaded_state.deinit();
@@ -234,21 +274,40 @@ fn handleStatus(
         return;
     }
 
-    try stdout.writeAll("NAME\tTARGET\tPROVIDER\tSTATUS\tHOST\tWORKSPACE\n");
+    try stdout.writeAll("NAME\tTARGET\tPROVIDER\tSTATUS\tREMOTE\tHOST\tWORKSPACE\n");
     for (loaded_state.value.machines) |machine| {
-        const target_name = machine.target_name orelse machine.name;
-        if (workspace.activeTracked(machine)) |tracked_workspace| {
-            const tracked_count = workspace.trackedCount(machine);
+        var refreshed = refreshMachineFromProvider(allocator, machine) catch |err| fallback: {
+            try std.fmt.format(
+                stderr,
+                "[warn] failed to refresh machine '{s}': {s}\n",
+                .{ machine.name, @errorName(err) },
+            );
+
+            var fallback = RefreshedMachine{
+                .value = machine,
+            };
+            fallback.value.remote_state = "refresh_failed";
+            break :fallback fallback;
+        };
+        defer refreshed.deinit(allocator);
+
+        try state.upsertMachine(allocator, refreshed.value, null);
+
+        const target_name = refreshed.value.target_name orelse refreshed.value.name;
+        const remote_state = refreshed.value.remote_state orelse "-";
+        if (workspace.activeTracked(refreshed.value)) |tracked_workspace| {
+            const tracked_count = workspace.trackedCount(refreshed.value);
             if (tracked_count > 1) {
                 try std.fmt.format(
                     stdout,
-                    "{s}\t{s}\t{s}\t{s}\t{s}\t{s} (+{d})\n",
+                    "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s} (+{d})\n",
                     .{
-                        machine.name,
+                        refreshed.value.name,
                         target_name,
-                        model.providerName(machine.provider),
-                        model.statusName(machine.status),
-                        machine.host,
+                        model.providerName(refreshed.value.provider),
+                        model.statusName(refreshed.value.status),
+                        remote_state,
+                        refreshed.value.host,
                         tracked_workspace.remote_path,
                         tracked_count - 1,
                     },
@@ -256,13 +315,14 @@ fn handleStatus(
             } else {
                 try std.fmt.format(
                     stdout,
-                    "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n",
+                    "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n",
                     .{
-                        machine.name,
+                        refreshed.value.name,
                         target_name,
-                        model.providerName(machine.provider),
-                        model.statusName(machine.status),
-                        machine.host,
+                        model.providerName(refreshed.value.provider),
+                        model.statusName(refreshed.value.status),
+                        remote_state,
+                        refreshed.value.host,
                         tracked_workspace.remote_path,
                     },
                 );
@@ -270,13 +330,14 @@ fn handleStatus(
         } else {
             try std.fmt.format(
                 stdout,
-                "{s}\t{s}\t{s}\t{s}\t{s}\t-\n",
+                "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t-\n",
                 .{
-                    machine.name,
+                    refreshed.value.name,
                     target_name,
-                    model.providerName(machine.provider),
-                    model.statusName(machine.status),
-                    machine.host,
+                    model.providerName(refreshed.value.provider),
+                    model.statusName(refreshed.value.status),
+                    remote_state,
+                    refreshed.value.host,
                 },
             );
         }
@@ -496,17 +557,17 @@ fn handleSsh(
     allocator: std.mem.Allocator,
     stdout: anytype,
     stderr: anytype,
-    target_name: []const u8,
+    command: WorkspaceTargetCommand,
 ) !void {
     var loaded_state = try state.loadOrEmpty(allocator, null);
     defer loaded_state.deinit();
 
-    const machine = state.findMachine(&loaded_state.value, target_name) orelse {
+    const machine = state.findMachine(&loaded_state.value, command.machine_name) orelse {
         try std.fmt.format(
             stdout,
             "[error] no tracked machine named '{s}'\n" ++
                 "[hint] run a target first so SSH knows where to connect\n",
-            .{target_name},
+            .{command.machine_name},
         );
         return error.HandledFailure;
     };
@@ -515,19 +576,22 @@ fn handleSsh(
         try std.fmt.format(
             stderr,
             "[error] machine '{s}' is being destroyed\n",
-            .{target_name},
+            .{command.machine_name},
         );
         return error.HandledFailure;
     }
 
-    const term = ssh.openInteractive(allocator, machine.*) catch |err| {
-        try std.fmt.format(
-            stderr,
-            "[error] failed to start ssh for machine '{s}': {s}\n",
-            .{ target_name, @errorName(err) },
-        );
-        return error.HandledFailure;
-    };
+    const term = if (command.workspace_selector) |selector|
+        try openWorkspaceSsh(allocator, stderr, machine.*, command.machine_name, selector)
+    else
+        ssh.openInteractive(allocator, machine.*) catch |err| {
+            try std.fmt.format(
+                stderr,
+                "[error] failed to start ssh for machine '{s}': {s}\n",
+                .{ command.machine_name, @errorName(err) },
+            );
+            return error.HandledFailure;
+        };
 
     switch (term) {
         .Exited => |code| {
@@ -545,6 +609,71 @@ fn handleSsh(
             return error.HandledFailure;
         },
     }
+}
+
+fn handleWorkspaces(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    stderr: anytype,
+    machine_name: []const u8,
+) !void {
+    var loaded_state = try state.loadOrEmpty(allocator, null);
+    defer loaded_state.deinit();
+
+    const machine = state.findMachine(&loaded_state.value, machine_name) orelse {
+        try std.fmt.format(
+            stderr,
+            "[error] no tracked machine named '{s}'\n" ++
+                "[hint] run a target first so there is a machine to inspect\n",
+            .{machine_name},
+        );
+        return error.HandledFailure;
+    };
+
+    if (workspace.trackedCount(machine.*) == 0) {
+        try std.fmt.format(
+            stdout,
+            "[info] machine '{s}' has no tracked workspaces yet\n" ++
+                "[hint] run `rove sync {s}` or `rove offload {s}` first\n",
+            .{ machine_name, machine_name, machine_name },
+        );
+        return;
+    }
+
+    const active = workspace.activeTracked(machine.*);
+    try stdout.writeAll("ACTIVE\tNAME\tLOCAL\tREMOTE\tTMUX\n");
+
+    if (machine.workspaces.len > 0) {
+        for (machine.workspaces) |tracked| {
+            try printWorkspaceRow(stdout, tracked, active);
+        }
+    } else if (machine.workspace) |tracked| {
+        try printWorkspaceRow(stdout, tracked, active);
+    }
+}
+
+fn printWorkspaceRow(
+    stdout: anytype,
+    tracked: model.WorkspaceRecord,
+    active: ?model.WorkspaceRecord,
+) !void {
+    const is_active = if (active) |record|
+        std.mem.eql(u8, record.local_path, tracked.local_path)
+    else
+        false;
+    const tmux_session = tracked.tmux_session orelse "-";
+
+    try std.fmt.format(
+        stdout,
+        "{s}\t{s}\t{s}\t{s}\t{s}\n",
+        .{
+            if (is_active) "*" else "-",
+            workspace.recordName(tracked),
+            tracked.local_path,
+            tracked.remote_path,
+            tmux_session,
+        },
+    );
 }
 
 fn handleSync(
@@ -647,8 +776,8 @@ fn handlePull(
             try std.fmt.format(
                 stderr,
                 "[error] machine '{s}' has no tracked workspace matching '{s}'\n" ++
-                    "[hint] use the workspace label, local path, or remote path from `rove status`\n",
-                .{ command.machine_name, command.workspace_selector.? },
+                    "[hint] use the workspace label, local path, or remote path from `rove workspaces {s}`\n",
+                .{ command.machine_name, command.workspace_selector.?, command.machine_name },
             );
             return error.HandledFailure;
         },
@@ -768,17 +897,17 @@ fn handleOffload(
     allocator: std.mem.Allocator,
     stdout: anytype,
     stderr: anytype,
-    target_name: []const u8,
+    command: WorkspaceTargetCommand,
 ) !void {
     var loaded_state = try state.loadOrEmpty(allocator, null);
     defer loaded_state.deinit();
 
-    const machine_ptr = state.findMachine(&loaded_state.value, target_name) orelse {
+    const machine_ptr = state.findMachine(&loaded_state.value, command.machine_name) orelse {
         try std.fmt.format(
             stderr,
             "[error] no tracked machine named '{s}'\n" ++
                 "[hint] run a target first so there is a machine to offload into\n",
-            .{target_name},
+            .{command.machine_name},
         );
         return error.HandledFailure;
     };
@@ -787,12 +916,27 @@ fn handleOffload(
         try std.fmt.format(
             stderr,
             "[error] machine '{s}' is being destroyed\n",
-            .{target_name},
+            .{command.machine_name},
         );
         return error.HandledFailure;
     }
 
     var machine = machine_ptr.*;
+    if (command.workspace_selector) |selector| {
+        const tracked = try resolveTrackedWorkspaceRecord(stderr, machine, command.machine_name, selector);
+        const resolved = try workspace.fromRecord(allocator, tracked);
+        defer resolved.deinit(allocator);
+
+        const planned = tmux.PlannedRestore{
+            .backend = .tracked,
+            .restore = try tmux.planTrackedWorkspaceSession(allocator, resolved, tracked.tmux_session),
+        };
+        defer planned.deinit(allocator);
+
+        try performOffload(allocator, stdout, stderr, &machine, command.machine_name, resolved, planned);
+        return;
+    }
+
     const resolved = try workspace.discover(allocator, machine);
     defer resolved.deinit(allocator);
 
@@ -816,79 +960,7 @@ fn handleOffload(
     };
     defer planned.deinit(allocator);
 
-    machine.status = .offloading;
-    try state.upsertMachine(allocator, machine, null);
-
-    try std.fmt.format(
-        stdout,
-        "[info] syncing workspace '{s}' to {s}\n" ++
-            "[info] tmux backend: {s}\n" ++
-            "[info] restoring tmux session '{s}'\n",
-        .{ resolved.local_root, resolved.remote_root, tmux.backendName(planned.backend), planned.restore.session_name },
-    );
-
-    const ran_bootstrap_hook = try syncResolvedWorkspace(
-        allocator,
-        stderr,
-        &machine,
-        target_name,
-        resolved,
-        .offloading,
-        .offload_failed,
-    );
-
-    tmux.applyRemote(allocator, machine, planned.restore) catch |err| {
-        machine.status = .offload_failed;
-        try state.upsertMachine(allocator, machine, null);
-
-        try std.fmt.format(
-            stderr,
-            "[error] tmux restore failed for machine '{s}': {s}\n",
-            .{ target_name, @errorName(err) },
-        );
-        return error.HandledFailure;
-    };
-
-    const tracked_workspaces = try workspace.mergeTracked(allocator, machine, workspace.buildRecord(resolved, planned.restore.session_name));
-    defer tracked_workspaces.deinit(allocator);
-
-    machine.workspace = tracked_workspaces.active;
-    machine.workspaces = tracked_workspaces.records;
-    machine.status = .ready;
-    try state.upsertMachine(allocator, machine, null);
-
-    if (ran_bootstrap_hook) {
-        try stdout.writeAll("[info] ran repo-local bootstrap hook .rove/bootstrap.sh\n");
-    }
-
-    const attach_command = try tmux.attachCommand(allocator, planned.restore);
-    defer allocator.free(attach_command);
-
-    const term = ssh.openInteractiveCommand(allocator, machine, attach_command) catch |err| {
-        try std.fmt.format(
-            stderr,
-            "[error] failed to attach remote tmux for machine '{s}': {s}\n",
-            .{ target_name, @errorName(err) },
-        );
-        return error.HandledFailure;
-    };
-
-    switch (term) {
-        .Exited => |code| {
-            if (code != 0) {
-                try std.fmt.format(
-                    stderr,
-                    "[error] remote tmux attach exited with code {d}\n",
-                    .{code},
-                );
-                return error.HandledFailure;
-            }
-        },
-        else => {
-            try stderr.writeAll("[error] remote tmux attach ended unexpectedly\n");
-            return error.HandledFailure;
-        },
-    }
+    try performOffload(allocator, stdout, stderr, &machine, command.machine_name, resolved, planned);
 }
 
 fn handleDown(
@@ -959,6 +1031,216 @@ fn renderPlacementSummary(
     }
 
     return allocator.dupe(u8, "runtime-selected region");
+}
+
+const RefreshedMachine = struct {
+    value: model.MachineRecord,
+    owned_machine_name: ?[]const u8 = null,
+    owned_host: ?[]const u8 = null,
+    owned_region: ?[]const u8 = null,
+    owned_remote_state: ?[]const u8 = null,
+
+    fn deinit(self: RefreshedMachine, allocator: std.mem.Allocator) void {
+        if (self.owned_machine_name) |machine_name| allocator.free(machine_name);
+        if (self.owned_host) |host| allocator.free(host);
+        if (self.owned_region) |region| allocator.free(region);
+        if (self.owned_remote_state) |remote_state| allocator.free(remote_state);
+    }
+};
+
+fn refreshMachineFromProvider(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+) !RefreshedMachine {
+    var refreshed = RefreshedMachine{
+        .value = machine,
+    };
+
+    const app = machine.app orelse {
+        refreshed.value.remote_state = "unknown";
+        return refreshed;
+    };
+
+    const inspected = try provider.inspect(allocator, machine.provider, .{
+        .app = app,
+        .machine_id = machine.id,
+    });
+
+    if (!inspected.exists) {
+        refreshed.value.remote_state = "missing";
+        return refreshed;
+    }
+
+    if (inspected.machine_name) |machine_name| {
+        refreshed.value.machine_name = machine_name;
+        refreshed.owned_machine_name = machine_name;
+    }
+    if (inspected.host) |host| {
+        refreshed.value.host = host;
+        refreshed.owned_host = host;
+    }
+    if (inspected.region) |region| {
+        refreshed.value.region = region;
+        refreshed.owned_region = region;
+    }
+
+    if (inspected.remote_state) |remote_state| {
+        refreshed.value.remote_state = remote_state;
+        refreshed.owned_remote_state = remote_state;
+    } else {
+        refreshed.value.remote_state = "unknown";
+    }
+
+    return refreshed;
+}
+
+fn resolveTrackedWorkspaceRecord(
+    stderr: anytype,
+    machine: model.MachineRecord,
+    machine_name: []const u8,
+    selector: []const u8,
+) !model.WorkspaceRecord {
+    return workspace.resolveTrackedSelector(machine, selector) catch |err| switch (err) {
+        error.WorkspaceNotFound => {
+            try std.fmt.format(
+                stderr,
+                "[error] machine '{s}' has no tracked workspace matching '{s}'\n" ++
+                    "[hint] use the workspace label, local path, or remote path from `rove workspaces {s}`\n",
+                .{ machine_name, selector, machine_name },
+            );
+            return error.HandledFailure;
+        },
+        error.AmbiguousWorkspaceSelector => {
+            try std.fmt.format(
+                stderr,
+                "[error] workspace selector '{s}' is ambiguous for machine '{s}'\n" ++
+                    "[hint] use the full local path or remote path to disambiguate\n",
+                .{ selector, machine_name },
+            );
+            return error.HandledFailure;
+        },
+        else => return err,
+    };
+}
+
+fn openWorkspaceSsh(
+    allocator: std.mem.Allocator,
+    stderr: anytype,
+    machine: model.MachineRecord,
+    machine_name: []const u8,
+    selector: []const u8,
+) !std.process.Child.Term {
+    const tracked = try resolveTrackedWorkspaceRecord(stderr, machine, machine_name, selector);
+    const resolved = try workspace.fromRecord(allocator, tracked);
+    defer resolved.deinit(allocator);
+
+    const planned = try tmux.planTrackedWorkspaceSession(allocator, resolved, tracked.tmux_session);
+    defer planned.deinit(allocator);
+
+    tmux.applyRemote(allocator, machine, planned) catch |err| {
+        try std.fmt.format(
+            stderr,
+            "[error] failed to prepare tmux workspace '{s}' on machine '{s}': {s}\n",
+            .{ selector, machine_name, @errorName(err) },
+        );
+        return error.HandledFailure;
+    };
+
+    const attach_command = try tmux.attachCommand(allocator, planned);
+    defer allocator.free(attach_command);
+
+    return ssh.openInteractiveCommand(allocator, machine, attach_command) catch |err| {
+        try std.fmt.format(
+            stderr,
+            "[error] failed to start workspace ssh for machine '{s}': {s}\n",
+            .{ machine_name, @errorName(err) },
+        );
+        return error.HandledFailure;
+    };
+}
+
+fn performOffload(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    stderr: anytype,
+    machine: *model.MachineRecord,
+    machine_name: []const u8,
+    resolved: workspace.ResolvedWorkspace,
+    planned: tmux.PlannedRestore,
+) !void {
+    machine.status = .offloading;
+    try state.upsertMachine(allocator, machine.*, null);
+
+    try std.fmt.format(
+        stdout,
+        "[info] syncing workspace '{s}' to {s}\n" ++
+            "[info] tmux backend: {s}\n" ++
+            "[info] restoring tmux session '{s}'\n",
+        .{ resolved.local_root, resolved.remote_root, tmux.backendName(planned.backend), planned.restore.session_name },
+    );
+
+    const ran_bootstrap_hook = try syncResolvedWorkspace(
+        allocator,
+        stderr,
+        machine,
+        machine_name,
+        resolved,
+        .offloading,
+        .offload_failed,
+    );
+
+    tmux.applyRemote(allocator, machine.*, planned.restore) catch |err| {
+        machine.status = .offload_failed;
+        try state.upsertMachine(allocator, machine.*, null);
+
+        try std.fmt.format(
+            stderr,
+            "[error] tmux restore failed for machine '{s}': {s}\n",
+            .{ machine_name, @errorName(err) },
+        );
+        return error.HandledFailure;
+    };
+
+    const tracked_workspaces = try workspace.mergeTracked(allocator, machine.*, workspace.buildRecord(resolved, planned.restore.session_name));
+    defer tracked_workspaces.deinit(allocator);
+
+    machine.workspace = tracked_workspaces.active;
+    machine.workspaces = tracked_workspaces.records;
+    machine.status = .ready;
+    try state.upsertMachine(allocator, machine.*, null);
+
+    if (ran_bootstrap_hook) {
+        try stdout.writeAll("[info] ran repo-local bootstrap hook .rove/bootstrap.sh\n");
+    }
+
+    const attach_command = try tmux.attachCommand(allocator, planned.restore);
+    defer allocator.free(attach_command);
+
+    const term = ssh.openInteractiveCommand(allocator, machine.*, attach_command) catch |err| {
+        try std.fmt.format(
+            stderr,
+            "[error] failed to attach remote tmux for machine '{s}': {s}\n",
+            .{ machine_name, @errorName(err) },
+        );
+        return error.HandledFailure;
+    };
+
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) {
+                try std.fmt.format(
+                    stderr,
+                    "[error] remote tmux attach exited with code {d}\n",
+                    .{code},
+                );
+                return error.HandledFailure;
+            }
+        },
+        else => {
+            try stderr.writeAll("[error] remote tmux attach ended unexpectedly\n");
+            return error.HandledFailure;
+        },
+    }
 }
 
 fn syncResolvedWorkspace(
@@ -1041,6 +1323,15 @@ test "parse sync target" {
     }
 }
 
+test "parse workspaces target" {
+    const command = try parse(&.{ "workspaces", "sam-east" });
+
+    switch (command) {
+        .workspaces => |name| try std.testing.expectEqualStrings("sam-east", name),
+        else => return error.InvalidArguments,
+    }
+}
+
 test "parse pull target" {
     const command = try parse(&.{ "pull", "sam-east" });
 
@@ -1064,6 +1355,30 @@ test "parse pull target with preview and force" {
             try std.testing.expect(pull_command.preview);
             try std.testing.expect(pull_command.force);
             try std.testing.expectEqualStrings("$HOME/work/repo", pull_command.workspace_selector.?);
+        },
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse ssh target with workspace selector" {
+    const command = try parse(&.{ "ssh", "sam-east", "--workspace", "project" });
+
+    switch (command) {
+        .ssh => |ssh_command| {
+            try std.testing.expectEqualStrings("sam-east", ssh_command.machine_name);
+            try std.testing.expectEqualStrings("project", ssh_command.workspace_selector.?);
+        },
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse offload target with workspace selector" {
+    const command = try parse(&.{ "offload", "sam-east", "--workspace", "$HOME/work/project" });
+
+    switch (command) {
+        .offload => |offload_command| {
+            try std.testing.expectEqualStrings("sam-east", offload_command.machine_name);
+            try std.testing.expectEqualStrings("$HOME/work/project", offload_command.workspace_selector.?);
         },
         else => return error.InvalidArguments,
     }

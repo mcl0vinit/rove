@@ -28,6 +28,26 @@ pub const DestroyRequest = struct {
     verbose: bool = false,
 };
 
+pub const InspectRequest = struct {
+    app: []const u8,
+    machine_id: []const u8,
+};
+
+pub const InspectResult = struct {
+    exists: bool,
+    machine_name: ?[]const u8 = null,
+    host: ?[]const u8 = null,
+    region: ?[]const u8 = null,
+    remote_state: ?[]const u8 = null,
+
+    pub fn deinit(self: InspectResult, allocator: std.mem.Allocator) void {
+        if (self.machine_name) |machine_name| allocator.free(machine_name);
+        if (self.host) |host| allocator.free(host);
+        if (self.region) |region| allocator.free(region);
+        if (self.remote_state) |remote_state| allocator.free(remote_state);
+    }
+};
+
 pub fn create(
     allocator: std.mem.Allocator,
     provider: model.ProviderKind,
@@ -46,4 +66,14 @@ pub fn destroy(
     switch (provider) {
         .fly => try fly.destroy(allocator, request),
     }
+}
+
+pub fn inspect(
+    allocator: std.mem.Allocator,
+    provider: model.ProviderKind,
+    request: InspectRequest,
+) !InspectResult {
+    return switch (provider) {
+        .fly => fly.inspect(allocator, request),
+    };
 }

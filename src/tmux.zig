@@ -10,6 +10,7 @@ const ArrayList = std.ArrayListUnmanaged;
 pub const AppliedBackend = enum {
     shape,
     hook,
+    tracked,
 };
 
 pub const RestorePlan = struct {
@@ -126,6 +127,34 @@ pub fn attachCommand(
     defer allocator.free(quoted);
 
     return std.fmt.allocPrint(allocator, "tmux attach -t {s}", .{quoted});
+}
+
+pub fn planTrackedWorkspaceSession(
+    allocator: std.mem.Allocator,
+    resolved: workspace.ResolvedWorkspace,
+    recorded_session: ?[]const u8,
+) !RestorePlan {
+    const session_name = recorded_session orelse resolved.name;
+    const quoted_session = try shell.quote(allocator, session_name);
+    defer allocator.free(quoted_session);
+
+    const quoted_remote_root = try workspace.quoteRemotePath(allocator, resolved.remote_root);
+    defer allocator.free(quoted_remote_root);
+
+    return .{
+        .session_name = try allocator.dupe(u8, session_name),
+        .remote_script = try std.fmt.allocPrint(
+            allocator,
+            \\set -euo pipefail
+            \\session={s}
+            \\if ! tmux has-session -t "$session" 2>/dev/null; then
+            \\  tmux new-session -d -s "$session" -c {s}
+            \\fi
+            \\
+        ,
+            .{ quoted_session, quoted_remote_root },
+        ),
+    };
 }
 
 fn captureCurrentOrDefault(

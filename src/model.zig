@@ -73,6 +73,7 @@ pub const MachineRecord = struct {
     app: ?[]const u8 = null,
     host: []const u8,
     region: ?[]const u8 = null,
+    remote_state: ?[]const u8 = null,
     ssh_user: []const u8,
     workspace: ?WorkspaceRecord = null,
     workspaces: []const WorkspaceRecord = &.{},

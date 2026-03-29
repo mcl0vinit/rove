@@ -59,7 +59,7 @@ pub fn create(
     const machine = try lookupMachineByName(allocator, request.target.app, machine_name);
 
     return .{
-        .machine_id = machine.id,
+        .machine_id = machine.id.?,
         .host = try std.fmt.allocPrint(allocator, "{s}.fly.dev", .{request.target.app}),
         .region = machine.region,
         .machine_name = machine.name,
@@ -87,6 +87,28 @@ pub fn destroy(
     }
 }
 
+pub fn inspect(
+    allocator: std.mem.Allocator,
+    request: provider.InspectRequest,
+) !provider.InspectResult {
+    const machine = try lookupMachineById(allocator, request.app, request.machine_id);
+    defer machine.deinit(allocator);
+
+    if (!machine.exists) {
+        return .{
+            .exists = false,
+        };
+    }
+
+    return .{
+        .exists = true,
+        .machine_name = if (machine.name) |name| try allocator.dupe(u8, name) else null,
+        .host = try std.fmt.allocPrint(allocator, "{s}.fly.dev", .{request.app}),
+        .region = if (machine.region) |region| try allocator.dupe(u8, region) else null,
+        .remote_state = if (machine.state) |state| try allocator.dupe(u8, state) else null,
+    };
+}
+
 pub fn flyctlVersion(allocator: std.mem.Allocator) !exec.Result {
     return exec.run(allocator, &.{ "flyctl", "version" });
 }
@@ -94,13 +116,23 @@ pub fn flyctlVersion(allocator: std.mem.Allocator) !exec.Result {
 const ListedMachine = struct {
     id: []const u8,
     name: []const u8,
+    state: ?[]const u8 = null,
     region: ?[]const u8 = null,
 };
 
 const FoundMachine = struct {
-    id: []u8,
-    name: []u8,
+    exists: bool = true,
+    id: ?[]u8 = null,
+    name: ?[]u8 = null,
+    state: ?[]u8 = null,
     region: ?[]u8 = null,
+
+    fn deinit(self: FoundMachine, allocator: std.mem.Allocator) void {
+        if (self.id) |id| allocator.free(id);
+        if (self.name) |name| allocator.free(name);
+        if (self.state) |state| allocator.free(state);
+        if (self.region) |region| allocator.free(region);
+    }
 };
 
 fn generatedMachineName(
@@ -187,28 +219,74 @@ fn lookupMachineByName(
             return error.CommandFailed;
         }
 
-        var parsed = try std.json.parseFromSlice([]const ListedMachine, allocator, result.stdout, .{
-            .allocate = .alloc_always,
-        });
-        defer parsed.deinit();
-
-        for (parsed.value) |machine| {
-            if (std.mem.eql(u8, machine.name, machine_name)) {
-                return .{
-                    .id = try allocator.dupe(u8, machine.id),
-                    .name = try allocator.dupe(u8, machine.name),
-                    .region = if (machine.region) |region|
-                        try allocator.dupe(u8, region)
-                    else
-                        null,
-                };
-            }
+        if (try findListedMachine(allocator, result.stdout, .name, machine_name)) |machine| {
+            return machine;
         }
 
         std.Thread.sleep(250 * std.time.ns_per_ms);
     }
 
     return error.CreatedMachineNotFound;
+}
+
+fn lookupMachineById(
+    allocator: std.mem.Allocator,
+    app: []const u8,
+    machine_id: []const u8,
+) !FoundMachine {
+    const result = try exec.run(allocator, &.{
+        "flyctl",
+        "machine",
+        "list",
+        "--app",
+        app,
+        "--json",
+    });
+    defer result.deinit(allocator);
+
+    if (!result.succeeded()) {
+        std.debug.print("[error] flyctl machine list failed\n{s}", .{result.stderr});
+        return error.CommandFailed;
+    }
+
+    return (try findListedMachine(allocator, result.stdout, .id, machine_id)) orelse .{
+        .exists = false,
+    };
+}
+
+const MatchField = enum {
+    id,
+    name,
+};
+
+fn findListedMachine(
+    allocator: std.mem.Allocator,
+    json_slice: []const u8,
+    field: MatchField,
+    needle: []const u8,
+) !?FoundMachine {
+    var parsed = try std.json.parseFromSlice([]const ListedMachine, allocator, json_slice, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    for (parsed.value) |machine| {
+        const matched = switch (field) {
+            .id => std.mem.eql(u8, machine.id, needle),
+            .name => std.mem.eql(u8, machine.name, needle),
+        };
+        if (!matched) continue;
+
+        return .{
+            .exists = true,
+            .id = try allocator.dupe(u8, machine.id),
+            .name = try allocator.dupe(u8, machine.name),
+            .state = if (machine.state) |state| try allocator.dupe(u8, state) else null,
+            .region = if (machine.region) |region| try allocator.dupe(u8, region) else null,
+        };
+    }
+
+    return null;
 }
 
 test "select fixed region first" {
