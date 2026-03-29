@@ -140,6 +140,11 @@ When we wire this into `rove.json`, a Fly CPU target will probably look roughly 
   "image": "registry.fly.io/devbox:deployment-<id>",
   "vm_size": "shared-cpu-2x",
   "ssh_user": "root",
-  "startup_script": "./scripts/bootstrap.sh"
+  "startup_script": "./scripts/bootstrap.sh",
+  "profile": {
+    "repo": "https://github.com/mcl0vinit/dotfiles.git",
+    "ref": "main",
+    "install_command": "./bin/bootstrap --apply"
+  }
 }
 ```

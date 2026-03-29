@@ -21,7 +21,7 @@ pub const ProfileConfig = struct {
     repo: []const u8,
     ref: ?[]const u8 = null,
     path: ?[]const u8 = null,
-    install_script: ?[]const u8 = null,
+    install_command: ?[]const u8 = null,
 };
 
 pub const TmuxBackendKind = enum {

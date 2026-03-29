@@ -8,6 +8,11 @@
       "vm_size": "shared-cpu-2x",
       "ssh_user": "root",
       "startup_script": "./scripts/bootstrap.sh",
+      "profile": {
+        "repo": "https://github.com/mcl0vinit/dotfiles.git",
+        "ref": "main",
+        "install_command": "./bin/bootstrap --apply"
+      },
       "tmux": {
         "backend": "auto",
         "capture_script": "./scripts/tmux-capture-dotfiles.sh"

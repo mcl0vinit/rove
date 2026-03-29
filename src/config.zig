@@ -11,7 +11,7 @@ pub const Error = std.fs.File.OpenError ||
         EmptyTargetName,
         MissingApp,
         MissingImage,
-        MissingProfileInstallScript,
+        MissingProfileInstallCommand,
         MissingProfilePath,
         MissingProfileRef,
         MissingProfileRepo,
@@ -90,8 +90,8 @@ fn validate(
             if (profile.path) |path| {
                 if (path.len == 0) return error.MissingProfilePath;
             }
-            if (profile.install_script) |install_script| {
-                if (install_script.len == 0) return error.MissingProfileInstallScript;
+            if (profile.install_command) |install_command| {
+                if (install_command.len == 0) return error.MissingProfileInstallCommand;
             }
         }
 
@@ -124,7 +124,7 @@ test "parse and resolve target" {
         \\{
         \\  "targets": [
         \\    {
-        \\      "name": "cpu",
+        \\      "name": "devbox",
         \\      "provider": "fly",
         \\      "app": "devbox",
         \\      "image": "registry.fly.io/devbox:latest",
@@ -141,7 +141,7 @@ test "parse and resolve target" {
     });
     defer parsed.deinit();
 
-    const target = try resolveTarget(&parsed.value, "cpu");
+    const target = try resolveTarget(&parsed.value, "devbox");
     try std.testing.expectEqualStrings("devbox", target.app);
     try std.testing.expectEqual(model.ProviderKind.fly, target.provider);
 }
@@ -152,7 +152,7 @@ test "reject duplicate target names" {
         \\{
         \\  "targets": [
         \\    {
-        \\      "name": "cpu",
+        \\      "name": "devbox",
         \\      "provider": "fly",
         \\      "app": "devbox",
         \\      "image": "registry.fly.io/devbox:latest",
@@ -161,7 +161,7 @@ test "reject duplicate target names" {
         \\      "startup_script": "./scripts/bootstrap.sh"
         \\    },
         \\    {
-        \\      "name": "cpu",
+        \\      "name": "devbox",
         \\      "provider": "fly",
         \\      "app": "devbox",
         \\      "image": "registry.fly.io/devbox:latest",
@@ -187,7 +187,7 @@ test "parse target with profile" {
         \\{
         \\  "targets": [
         \\    {
-        \\      "name": "cpu",
+        \\      "name": "devbox",
         \\      "provider": "fly",
         \\      "app": "devbox",
         \\      "image": "registry.fly.io/devbox:latest",
@@ -197,7 +197,7 @@ test "parse target with profile" {
         \\      "profile": {
         \\        "repo": "git@github.com:example/dotfiles.git",
         \\        "ref": "main",
-        \\        "install_script": "./install.sh"
+        \\        "install_command": "./bin/bootstrap --apply"
         \\      }
         \\    }
         \\  ]
@@ -209,9 +209,10 @@ test "parse target with profile" {
     });
     defer parsed.deinit();
 
-    const target = try resolveTarget(&parsed.value, "cpu");
+    const target = try resolveTarget(&parsed.value, "devbox");
     try std.testing.expect(target.profile != null);
     try std.testing.expectEqualStrings("git@github.com:example/dotfiles.git", target.profile.?.repo);
+    try std.testing.expectEqualStrings("./bin/bootstrap --apply", target.profile.?.install_command.?);
 }
 
 test "parse target with auto tmux hook" {
@@ -220,7 +221,7 @@ test "parse target with auto tmux hook" {
         \\{
         \\  "targets": [
         \\    {
-        \\      "name": "cpu",
+        \\      "name": "devbox",
         \\      "provider": "fly",
         \\      "app": "devbox",
         \\      "image": "registry.fly.io/devbox:latest",
@@ -241,7 +242,7 @@ test "parse target with auto tmux hook" {
     });
     defer parsed.deinit();
 
-    const target = try resolveTarget(&parsed.value, "cpu");
+    const target = try resolveTarget(&parsed.value, "devbox");
     try std.testing.expectEqual(model.TmuxBackendKind.auto, target.tmux.backend);
     try std.testing.expectEqualStrings("/tmp/tmux-capture", target.tmux.capture_script.?);
 }
@@ -252,7 +253,7 @@ test "reject tmux hook config without capture script" {
         \\{
         \\  "targets": [
         \\    {
-        \\      "name": "cpu",
+        \\      "name": "devbox",
         \\      "provider": "fly",
         \\      "app": "devbox",
         \\      "image": "registry.fly.io/devbox:latest",

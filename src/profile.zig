@@ -63,19 +63,16 @@ fn buildApplyCommand(
         \\
     , .{ repo_quoted, ref_quoted, path_assignment });
 
-    if (profile.install_script) |install_script| {
-        const install_script_quoted = try shell.quote(allocator, install_script);
-        defer allocator.free(install_script_quoted);
+    if (profile.install_command) |install_command| {
+        const install_command_quoted = try shell.quote(allocator, install_command);
+        defer allocator.free(install_command_quoted);
 
         try command.writer.print(
+            \\profile_install_command={s}
             \\cd "$profile_dir"
-            \\if [[ ! -f {0s} ]]; then
-            \\  echo "missing profile install script" >&2
-            \\  exit 1
-            \\fi
-            \\bash {0s}
+            \\eval "$profile_install_command"
             \\
-        , .{install_script_quoted});
+        , .{install_command_quoted});
     }
 
     return allocator.dupe(u8, command.written());
@@ -110,15 +107,16 @@ test "default path assignment expands HOME on the remote shell" {
     try std.testing.expectEqualStrings("\"$HOME/.local/share/rove/profiles/default\"", path_value);
 }
 
-test "build command includes install script when configured" {
+test "build command includes install command when configured" {
     const allocator = std.testing.allocator;
     const command = try buildApplyCommand(allocator, .{
         .repo = "git@github.com:example/dotfiles.git",
         .ref = "main",
-        .install_script = "./install.sh",
+        .install_command = "./bin/bootstrap --apply",
     });
     defer allocator.free(command);
 
     try std.testing.expect(std.mem.indexOf(u8, command, "git -C \"$profile_dir\" fetch --depth 1 origin \"$profile_ref\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, command, "bash './install.sh'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, command, "profile_install_command='./bin/bootstrap --apply'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, command, "eval \"$profile_install_command\"") != null);
 }
