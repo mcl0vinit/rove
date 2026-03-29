@@ -66,12 +66,13 @@ pub fn create(
     }
 
     const machine = try lookupMachineByName(allocator, request.target.app, machine_name);
+    defer machine.deinit(allocator);
 
     return .{
-        .machine_id = machine.id.?,
+        .machine_id = try allocator.dupe(u8, machine.id.?),
         .host = try std.fmt.allocPrint(allocator, "{s}.fly.dev", .{request.target.app}),
-        .region = machine.region,
-        .machine_name = machine.name,
+        .region = if (machine.region) |region| try allocator.dupe(u8, region) else null,
+        .machine_name = if (machine.name) |name| try allocator.dupe(u8, name) else null,
     };
 }
 
