@@ -1,0 +1,275 @@
+const std = @import("std");
+const exec = @import("exec.zig");
+const model = @import("model.zig");
+const paths = @import("paths.zig");
+const shell = @import("shell.zig");
+
+pub const WaitOptions = struct {
+    timeout_ms: u64 = 180 * std.time.ms_per_s,
+    poll_interval_ms: u64 = 2 * std.time.ms_per_s,
+};
+
+const ConnectionParts = struct {
+    destination: []u8,
+    user_known_hosts: []u8,
+    host_key_alias: []u8,
+
+    fn deinit(self: ConnectionParts, allocator: std.mem.Allocator) void {
+        allocator.free(self.destination);
+        allocator.free(self.user_known_hosts);
+        allocator.free(self.host_key_alias);
+    }
+};
+
+pub fn waitForReady(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    options: WaitOptions,
+) !void {
+    const deadline_ms = std.time.milliTimestamp() + @as(i64, @intCast(options.timeout_ms));
+    var last_stderr: ?[]u8 = null;
+    defer if (last_stderr) |stderr| allocator.free(stderr);
+
+    while (true) {
+        const result = try runBatchCommand(allocator, machine, "true");
+        defer result.deinit(allocator);
+
+        if (result.succeeded()) {
+            return;
+        }
+
+        if (last_stderr) |stderr| allocator.free(stderr);
+        last_stderr = if (result.stderr.len > 0)
+            try allocator.dupe(u8, result.stderr)
+        else
+            null;
+
+        if (isFatalFailure(result.stderr)) {
+            if (result.stderr.len > 0) {
+                std.debug.print("[error] ssh authentication failed\n{s}", .{result.stderr});
+            }
+            return error.AuthenticationFailed;
+        }
+
+        if (std.time.milliTimestamp() >= deadline_ms) {
+            if (last_stderr) |stderr| {
+                std.debug.print("[error] ssh did not become reachable before timeout\n{s}", .{stderr});
+            }
+            return error.ConnectTimedOut;
+        }
+
+        std.Thread.sleep(options.poll_interval_ms * std.time.ns_per_ms);
+    }
+}
+
+pub fn runBatchCommand(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    remote_command: []const u8,
+) !exec.Result {
+    const connection = try prepareConnection(allocator, machine);
+    defer connection.deinit(allocator);
+
+    var args = std.ArrayListUnmanaged([]const u8){};
+    defer args.deinit(allocator);
+
+    try appendCommonArgs(allocator, &args, connection, true, true);
+    try args.appendSlice(allocator, &.{ "-T", connection.destination, remote_command });
+
+    return exec.run(allocator, args.items);
+}
+
+pub fn uploadFile(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    local_path: []const u8,
+    remote_path: []const u8,
+) !void {
+    const connection = try prepareConnection(allocator, machine);
+    defer connection.deinit(allocator);
+
+    const remote_spec = try std.fmt.allocPrint(allocator, "{s}:{s}", .{
+        connection.destination,
+        remote_path,
+    });
+    defer allocator.free(remote_spec);
+
+    var args = std.ArrayListUnmanaged([]const u8){};
+    defer args.deinit(allocator);
+
+    try args.append(allocator, "scp");
+    try args.append(allocator, "-q");
+    try appendOpenSshOptions(allocator, &args, connection, true, true);
+    try args.appendSlice(allocator, &.{ local_path, remote_spec });
+
+    const result = try exec.run(allocator, args.items);
+    defer result.deinit(allocator);
+
+    if (!result.succeeded()) {
+        if (result.stderr.len > 0) {
+            std.debug.print("[error] bootstrap upload failed\n{s}", .{result.stderr});
+        }
+        return error.CommandFailed;
+    }
+}
+
+pub fn openInteractive(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+) !std.process.Child.Term {
+    const connection = try prepareConnection(allocator, machine);
+    defer connection.deinit(allocator);
+
+    var args = std.ArrayListUnmanaged([]const u8){};
+    defer args.deinit(allocator);
+
+    try args.append(allocator, "ssh");
+    try appendOpenSshOptions(allocator, &args, connection, false, false);
+    try args.append(allocator, connection.destination);
+
+    return exec.runInteractive(allocator, args.items);
+}
+
+pub fn openInteractiveCommand(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    remote_command: []const u8,
+) !std.process.Child.Term {
+    const connection = try prepareConnection(allocator, machine);
+    defer connection.deinit(allocator);
+
+    var args = std.ArrayListUnmanaged([]const u8){};
+    defer args.deinit(allocator);
+
+    try args.append(allocator, "ssh");
+    try appendOpenSshOptions(allocator, &args, connection, false, false);
+    try args.appendSlice(allocator, &.{ "-t", connection.destination, remote_command });
+
+    return exec.runInteractive(allocator, args.items);
+}
+
+pub fn rsyncTransportCommand(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+) ![]u8 {
+    const connection = try prepareConnection(allocator, machine);
+    defer connection.deinit(allocator);
+
+    const parts = [_][]const u8{
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "PreferredAuthentications=publickey",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        connection.user_known_hosts,
+        "-o",
+        connection.host_key_alias,
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "LogLevel=ERROR",
+    };
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    for (parts, 0..) |part, index| {
+        if (index > 0) try writer.writer.writeByte(' ');
+        const quoted = try shell.quote(allocator, part);
+        defer allocator.free(quoted);
+        try writer.writer.writeAll(quoted);
+    }
+
+    return allocator.dupe(u8, writer.written());
+}
+
+fn prepareConnection(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+) !ConnectionParts {
+    const known_hosts_path = try paths.defaultKnownHostsPath(allocator);
+    errdefer allocator.free(known_hosts_path);
+    defer allocator.free(known_hosts_path);
+
+    if (std.fs.path.dirname(known_hosts_path)) |dir| {
+        try std.fs.cwd().makePath(dir);
+    }
+
+    const destination = try std.fmt.allocPrint(allocator, "{s}@{s}", .{
+        machine.ssh_user,
+        machine.host,
+    });
+    errdefer allocator.free(destination);
+
+    const user_known_hosts = try std.fmt.allocPrint(allocator, "UserKnownHostsFile={s}", .{
+        known_hosts_path,
+    });
+    errdefer allocator.free(user_known_hosts);
+
+    const host_key_alias = try std.fmt.allocPrint(allocator, "HostKeyAlias={s}", .{
+        machine.id,
+    });
+    errdefer allocator.free(host_key_alias);
+
+    return .{
+        .destination = destination,
+        .user_known_hosts = user_known_hosts,
+        .host_key_alias = host_key_alias,
+    };
+}
+
+fn appendCommonArgs(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayListUnmanaged([]const u8),
+    connection: ConnectionParts,
+    batch_mode: bool,
+    quiet: bool,
+) !void {
+    try args.append(allocator, "ssh");
+    try appendOpenSshOptions(allocator, args, connection, batch_mode, quiet);
+}
+
+fn appendOpenSshOptions(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayListUnmanaged([]const u8),
+    connection: ConnectionParts,
+    batch_mode: bool,
+    quiet: bool,
+) !void {
+    if (batch_mode) {
+        try args.appendSlice(allocator, &.{ "-o", "BatchMode=yes" });
+    }
+
+    try args.appendSlice(allocator, &.{
+        "-o",
+        "PreferredAuthentications=publickey",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        connection.user_known_hosts,
+        "-o",
+        connection.host_key_alias,
+        "-o",
+        "ConnectTimeout=5",
+    });
+
+    if (quiet) {
+        try args.appendSlice(allocator, &.{ "-o", "LogLevel=ERROR" });
+    }
+}
+
+fn isFatalFailure(stderr: []const u8) bool {
+    return std.mem.indexOf(u8, stderr, "Permission denied") != null or
+        std.mem.indexOf(u8, stderr, "Host key verification failed") != null or
+        std.mem.indexOf(u8, stderr, "REMOTE HOST IDENTIFICATION HAS CHANGED") != null or
+        std.mem.indexOf(u8, stderr, "Too many authentication failures") != null;
+}
+
+test "treat authentication issues as fatal" {
+    try std.testing.expect(isFatalFailure("Permission denied (publickey).\n"));
+    try std.testing.expect(isFatalFailure("Host key verification failed.\n"));
+    try std.testing.expect(!isFatalFailure("ssh: connect to host devbox.fly.dev port 22: Connection refused\n"));
+}

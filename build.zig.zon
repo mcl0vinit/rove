@@ -1,0 +1,12 @@
+.{
+    .fingerprint = 0xe74470b1bc432389,
+    .name = .rove,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
