@@ -3,14 +3,13 @@
     {
       "name": "devbox",
       "provider": "fly",
-      "app": "mcl0vinit-devbox",
-      "image": "registry.fly.io/mcl0vinit-devbox:latest@sha256:bfb26787a0a5e8ce92479a2f0d611d418bdab207ec581d68c0742e46c58dc726",
+      "app": "your-fly-app",
+      "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
       "vm_size": "shared-cpu-2x",
       "ssh_user": "rove",
       "startup_script": "./scripts/bootstrap.sh",
       "tmux": {
-        "backend": "auto",
-        "capture_script": "./scripts/tmux-capture-dotfiles.sh"
+        "backend": "shape"
       }
     }
   ]

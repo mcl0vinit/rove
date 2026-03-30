@@ -44,23 +44,26 @@ Language runtimes should come from each project's own flake.
 
 ## Initial setup
 
-1. The app name in `fly.toml` is already set to `mcl0vinit-devbox`.
+1. Update the app name in `fly.toml`.
+
+The checked-in value, `mcl0vinit-devbox`, is this repo's published example and should be replaced for your own deployment.
+
 2. Create the app:
 
 ```bash
-fly apps create mcl0vinit-devbox
+fly apps create <your-fly-app>
 ```
 
 3. Set your SSH public key as a secret:
 
 ```bash
-fly secrets set AUTHORIZED_KEYS="$(cat ~/.ssh/id_ed25519.pub)" --app mcl0vinit-devbox
+fly secrets set AUTHORIZED_KEYS="$(cat ~/.ssh/id_ed25519.pub)" --app <your-fly-app>
 ```
 
 4. If you want normal public `ssh` / `scp` / `rsync`, allocate a dedicated IPv4:
 
 ```bash
-fly ips allocate-v4 --app mcl0vinit-devbox
+fly ips allocate-v4 --app <your-fly-app>
 ```
 
 5. Deploy the image.
@@ -74,7 +77,7 @@ fly deploy --region <closest-region>
 6. Optional: create a volume only if you want region stickiness more than roaming placement:
 
 ```bash
-fly volumes create data --app mcl0vinit-devbox --region <your-region> --size 20
+fly volumes create data --app <your-fly-app> --region <your-region> --size 20
 ```
 
 7. If you create that volume, uncomment the mount in `fly.toml`.
@@ -110,7 +113,7 @@ The image is pinned to a specific dotfiles commit in `Dockerfile` via `DOTFILES_
 Rove target configs should also pin the resulting image ref by digest. The repo helper for that is:
 
 ```bash
-./scripts/pin-image-ref.sh devbox 'registry.fly.io/mcl0vinit-devbox:latest@sha256:<digest>'
+./scripts/pin-image-ref.sh devbox 'registry.fly.io/<your-fly-app>:latest@sha256:<digest>'
 ```
 
 ## Access modes
@@ -120,7 +123,7 @@ Rove target configs should also pin the resulting image ref by digest. The repo 
 If you allocated a dedicated IPv4, you can connect with:
 
 ```bash
-ssh rove@mcl0vinit-devbox.fly.dev
+ssh rove@<your-fly-app>.fly.dev
 ```
 
 This SSH service is intentionally locked down:
@@ -136,7 +139,7 @@ This SSH service is intentionally locked down:
 If you skip public raw SSH for now, Fly's own access path still works:
 
 ```bash
-fly ssh console --app mcl0vinit-devbox
+fly ssh console --app <your-fly-app>
 ```
 
 ## Notes
@@ -154,8 +157,8 @@ The default `devbox` target now assumes dotfiles are already in the image, so it
 {
   "name": "devbox",
   "provider": "fly",
-  "app": "mcl0vinit-devbox",
-  "image": "registry.fly.io/mcl0vinit-devbox:latest@sha256:<digest>",
+  "app": "your-fly-app",
+  "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
   "vm_size": "shared-cpu-2x",
   "ssh_user": "rove",
   "startup_script": "./scripts/bootstrap.sh"

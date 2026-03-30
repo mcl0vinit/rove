@@ -1,17 +1,98 @@
 # Rove
 
-Rove is a personal CLI for bringing up a remote devbox, syncing a workspace into it, handing off tmux state, and pulling work back down later.
+Rove provisions a remote devbox, syncs a workspace into it, hands off tmux state, and pulls changes back later.
 
-V1 is intentionally narrow:
+The current V1 focuses on one use case and doing it well:
 - Fly Machines only
 - CPU devboxes only
 - one baked devbox image
 - local JSON state in `~/.rove/state.json`
 - repo sync with `rsync`
-- tmux handoff with either plain layout restore or your dotfiles-aware hook
+- tmux handoff with either plain layout restore or a custom capture hook
 - locked-down SSH with no agent or port forwarding
 
-## Current command set
+## What Rove Does
+
+- starts an ephemeral remote machine from a pinned image
+- waits for SSH and runs a bootstrap script
+- syncs a local repo to the remote workspace
+- restores tmux layout and reconnects you to the session
+- tracks machine and workspace state locally
+- helps recover when local state and provider state drift
+
+## Install
+
+Install from GitHub with Nix:
+
+```bash
+nix profile add github:mcl0vinit/rove
+rove help
+```
+
+If you are working from a checkout:
+
+```bash
+nix develop
+nix develop -c zig build test
+```
+
+## Core Concepts
+
+- `target`: a named machine definition in `rove.json`
+- `name`: a tracked machine instance name such as `work` or `sam-east`
+- `workspace`: a repo synced to that machine
+
+## Quick Start
+
+1. Set up a Fly app and publish the base image from [`infra/fly/devbox/`](infra/fly/devbox/README.md).
+2. Copy [`rove.example.json`](rove.example.json) to `rove.json`.
+3. Replace the example `app` and `image` values with your own Fly app and pinned image digest.
+4. Run `rove doctor` to verify local prerequisites.
+5. Start a machine, sync your repo, and offload your tmux session.
+
+Example:
+
+```bash
+cp rove.example.json rove.json
+rove doctor
+rove run devbox --name work
+rove auth work
+rove sync work
+rove offload work
+```
+
+If you explicitly want local GitHub CLI auth copied to the remote box too:
+
+```bash
+rove auth work --copy-gh
+```
+
+## Example Config
+
+Use [`rove.example.json`](rove.example.json) as a starting point:
+
+```json
+{
+  "targets": [
+    {
+      "name": "devbox",
+      "provider": "fly",
+      "app": "your-fly-app",
+      "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
+      "vm_size": "shared-cpu-2x",
+      "ssh_user": "rove",
+      "startup_script": "./scripts/bootstrap.sh",
+      "tmux": {
+        "backend": "shape"
+      }
+    }
+  ]
+}
+```
+
+The checked-in `rove.json` in this repo is a working repo-local config for development. Treat `rove.example.json` as the public template.
+
+## Command Overview
 
 ```bash
 rove run <target> [--name <name>]
@@ -28,6 +109,34 @@ rove adopt <target> <machine-id> [--name <name>]
 rove down <name>
 ```
 
+Common workflow:
+
+```bash
+rove run devbox --name work
+rove auth work
+rove sync work
+rove offload work
+```
+
+Reconnect later:
+
+```bash
+rove ssh work
+```
+
+Preview or pull changes back:
+
+```bash
+rove pull work --preview
+rove pull work
+```
+
+Destroy the machine:
+
+```bash
+rove down work
+```
+
 Workspace selectors accepted by `pull`, `ssh`, and `offload`:
 - `active`
 - a workspace index from `rove workspaces <name>`
@@ -35,142 +144,52 @@ Workspace selectors accepted by `pull`, `ssh`, and `offload`:
 - a full local path
 - a full remote path
 
-## Requirements
+## Security Model
 
-- Nix with flakes enabled
-- Fly CLI authenticated for the target app
-- `jq`
-- local `ssh-keygen`
+Rove is designed for personal remote development, not as a hardened bastion host.
 
-The repo flake already gives you the normal dev shell:
+Current defaults:
+- SSH is key-only
+- root login is disabled
+- SSH agent forwarding is disabled
+- TCP, stream-local, and tunnel forwarding are disabled
+- plain authorized keys are rewritten to `restrict,pty`
+- `rove auth` installs a separate Git SSH key, not your normal machine SSH key
+- GitHub CLI auth is opt-in and only copied with `--copy-gh`
 
-```bash
-nix develop
-```
+Important limitation:
+- if someone gets shell access to the box, anything you intentionally copied there is exposed
 
-## First-time setup
+So the safe default is:
+- use `rove auth <name>` for SSH Git access
+- only use `rove auth <name> --copy-gh` if you explicitly want GitHub CLI auth on that box
 
-1. Build and test the CLI:
-
-```bash
-nix develop -c zig build test
-nix develop -c zig build integration
-```
-
-2. Set up the Fly app and base image using [`infra/fly/devbox/README.md`](infra/fly/devbox/README.md).
-
-3. Confirm `rove.json` points at a pinned image ref, not plain `:latest`.
-
-The repo currently ships with a pinned working image ref in [`rove.json`](rove.json) and [`rove.example.json`](rove.example.json).
-
-## Publishing and pinning the devbox image
-
-Rebuild and publish the base image from `infra/fly/devbox/`:
-
-```bash
-cd infra/fly/devbox
-fly deploy --push --app mcl0vinit-devbox
-```
-
-After you know the new full image ref, update the target config with:
-
-```bash
-./scripts/pin-image-ref.sh devbox 'registry.fly.io/mcl0vinit-devbox:latest@sha256:<digest>'
-```
-
-That updates both [`rove.json`](rove.json) and [`rove.example.json`](rove.example.json).
-
-## Normal workflow
-
-Create a machine:
-
-```bash
-nix run . -- run devbox --name sam-east
-```
-
-Sync the current repo:
-
-```bash
-nix run . -- sync sam-east
-```
-
-Move your tmux workspace up and attach:
-
-```bash
-nix run . -- offload sam-east
-```
-
-Reconnect later:
-
-```bash
-nix run . -- ssh sam-east
-```
-
-Preview or pull changes back:
-
-```bash
-nix run . -- pull sam-east --preview
-nix run . -- pull sam-east
-```
-
-Tear the box down:
-
-```bash
-nix run . -- down sam-east
-```
-
-## Remote auth story
-
-V1 is opinionated:
-- no SSH agent forwarding
-- no SSH port forwarding through the devbox
-- Git SSH access uses a dedicated Rove-managed Git key, not the machine access key
-- local `gh` auth is opt-in and is only copied when you pass `--copy-gh`
-
-Run:
-
-```bash
-nix run . -- auth sam-east
-```
-
-That does two things by default:
-- uploads the dedicated Git auth key to `~/.ssh/rove_git_ed25519` on the remote box
-- installs a managed GitHub block in `~/.ssh/config`
-
-If you explicitly want your local GitHub CLI auth copied to the box too:
-
-```bash
-nix run . -- auth sam-east --copy-gh
-```
-
-If private SSH Git remotes still fail, add the printed `rove-github` public key to GitHub once and rerun `rove auth <name>`.
-
-## Recovery workflow
+## Recovery
 
 Refresh local state from Fly:
 
 ```bash
-nix run . -- refresh
-nix run . -- refresh sam-east
+rove refresh
+rove refresh work
 ```
 
 Prune machines that were deleted outside Rove:
 
 ```bash
-nix run . -- refresh --prune-missing
+rove refresh --prune-missing
 ```
 
-Import an existing machine:
+Run a health check:
 
 ```bash
-nix run . -- adopt devbox <machine-id> --name sam-east
+rove doctor
+rove doctor work
 ```
 
-Run a full health check:
+Adopt an existing machine:
 
 ```bash
-nix run . -- doctor
-nix run . -- doctor sam-east
+rove adopt devbox <machine-id> --name recovered
 ```
 
 `doctor` checks:
@@ -178,32 +197,37 @@ nix run . -- doctor sam-east
 - config loading
 - pinned image refs
 - managed SSH keys
-- local GitHub auth availability
+- optional local GitHub auth availability
 - tracked machine reachability
 - stale SSH host keys, with automatic cleanup and retry
 
-## Testing
+## Building The Devbox Image
 
-Unit tests:
+The Fly image scaffold lives in [`infra/fly/devbox/`](infra/fly/devbox/README.md).
+
+After publishing a new image, pin its digest into your config:
+
+```bash
+./scripts/pin-image-ref.sh devbox 'registry.fly.io/your-fly-app:latest@sha256:<digest>'
+```
+
+## Development
+
+Run tests:
 
 ```bash
 nix develop -c zig build test
+nix develop -c zig build integration
 ```
 
-Scripted fake-provider smoke test:
+Run the fake-provider smoke test directly:
 
 ```bash
 nix develop -c zig build
 ./scripts/integration-smoke.sh
 ```
 
-Or via Zig:
-
-```bash
-nix develop -c zig build integration
-```
-
-## Explicit V1 non-goals
+## V1 Non-Goals
 
 - GPU providers
 - multiple providers
