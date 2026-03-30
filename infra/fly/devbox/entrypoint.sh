@@ -37,6 +37,25 @@ EOF
   exit 1
 fi
 
+tmp_authorized_keys="$(mktemp)"
+while IFS= read -r line || [[ -n "${line}" ]]; do
+  case "${line}" in
+    ""|\#*)
+      printf '%s\n' "${line}" >> "${tmp_authorized_keys}"
+      ;;
+    restrict,pty\ *|restrict,pty,*)
+      printf '%s\n' "${line}" >> "${tmp_authorized_keys}"
+      ;;
+    ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-nistp*\ *|sk-ssh-ed25519*\ *|sk-ecdsa-sha2-nistp*\ *)
+      printf 'restrict,pty %s\n' "${line}" >> "${tmp_authorized_keys}"
+      ;;
+    *)
+      printf '%s\n' "${line}" >> "${tmp_authorized_keys}"
+      ;;
+  esac
+done < "${authorized_keys_file}"
+mv "${tmp_authorized_keys}" "${authorized_keys_file}"
+
 chown "${login_user}:${login_group}" "${authorized_keys_file}"
 chmod 600 "${authorized_keys_file}"
 

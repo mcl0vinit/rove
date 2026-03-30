@@ -9,6 +9,7 @@ V1 is intentionally narrow:
 - local JSON state in `~/.rove/state.json`
 - repo sync with `rsync`
 - tmux handoff with either plain layout restore or your dotfiles-aware hook
+- locked-down SSH with no agent or port forwarding
 
 ## Current command set
 
@@ -122,6 +123,7 @@ nix run . -- down sam-east
 
 V1 is opinionated:
 - no SSH agent forwarding
+- no SSH port forwarding through the devbox
 - Git SSH access uses a dedicated Rove-managed Git key, not the machine access key
 - if local `gh` auth exists, `rove auth <name>` copies that config to the remote machine too
 

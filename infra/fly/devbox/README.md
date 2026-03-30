@@ -38,8 +38,8 @@ Language runtimes should come from each project's own flake.
 
 - `flake.nix`: declarative package set for the base image
 - `Dockerfile`: builds on Debian, layers a single-user Nix install on top, and applies the pinned dotfiles baseline during image build
-- `entrypoint.sh`: prepares SSH keys and starts `sshd`
-- `sshd_config`: raw SSH service on internal port `2222`
+- `entrypoint.sh`: prepares SSH keys, restricts plain authorized key entries, and starts `sshd`
+- `sshd_config`: raw SSH service on internal port `2222`, locked down for shell/file transfer only
 - `fly.toml`: starter app config for a CPU-only Fly app
 
 ## Initial setup
@@ -122,6 +122,14 @@ If you allocated a dedicated IPv4, you can connect with:
 ```bash
 ssh rove@mcl0vinit-devbox.fly.dev
 ```
+
+This SSH service is intentionally locked down:
+- key-only login
+- no root login
+- no agent forwarding
+- no TCP or stream-local forwarding
+- no SSH tunnel forwarding
+- plain key entries are rewritten to `restrict,pty` at boot so a copied public key cannot be used for forwarding even if client config requests it
 
 ### Fly console / Fly SSH
 
