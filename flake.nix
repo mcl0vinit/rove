@@ -68,6 +68,7 @@
             [
               zig
               git
+              gh
               openssh
               rsync
               tmux

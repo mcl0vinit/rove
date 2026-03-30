@@ -25,7 +25,30 @@ pub fn ensureManagedKeyPair(allocator: std.mem.Allocator) !ManagedKeyPair {
         try std.fs.cwd().makePath(dir);
     }
 
-    try ensureKeyMaterial(allocator, private_key_path, public_key_path);
+    try ensureKeyMaterial(allocator, private_key_path, public_key_path, "rove-managed");
+
+    const public_key = try readTrimmedFile(allocator, public_key_path);
+    errdefer allocator.free(public_key);
+
+    return .{
+        .private_key_path = private_key_path,
+        .public_key_path = public_key_path,
+        .public_key = public_key,
+    };
+}
+
+pub fn ensureGitAuthKeyPair(allocator: std.mem.Allocator) !ManagedKeyPair {
+    const private_key_path = try paths.defaultGitAuthPrivateKeyPath(allocator);
+    errdefer allocator.free(private_key_path);
+
+    const public_key_path = try paths.defaultGitAuthPublicKeyPath(allocator);
+    errdefer allocator.free(public_key_path);
+
+    if (std.fs.path.dirname(private_key_path)) |dir| {
+        try std.fs.cwd().makePath(dir);
+    }
+
+    try ensureKeyMaterial(allocator, private_key_path, public_key_path, "rove-github");
 
     const public_key = try readTrimmedFile(allocator, public_key_path);
     errdefer allocator.free(public_key);
@@ -41,6 +64,7 @@ fn ensureKeyMaterial(
     allocator: std.mem.Allocator,
     private_key_path: []const u8,
     public_key_path: []const u8,
+    comment: []const u8,
 ) !void {
     const private_exists = fileExists(private_key_path);
     const public_exists = fileExists(public_key_path);
@@ -54,7 +78,7 @@ fn ensureKeyMaterial(
             "-N",
             "",
             "-C",
-            "rove-managed",
+            comment,
             "-f",
             private_key_path,
         });

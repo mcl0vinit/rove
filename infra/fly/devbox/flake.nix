@@ -35,6 +35,7 @@
               direnv
               fd
               findutils
+              gh
               git
               gnugrep
               gnutar

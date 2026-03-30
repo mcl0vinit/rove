@@ -69,6 +69,30 @@ pub fn runBatchCommand(
     machine: model.MachineRecord,
     remote_command: []const u8,
 ) !exec.Result {
+    return runBatchCommandWithRecovery(allocator, machine, remote_command, true);
+}
+
+pub fn preflight(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+) !void {
+    const result = try runBatchCommand(allocator, machine, "true");
+    defer result.deinit(allocator);
+
+    if (!result.succeeded()) {
+        if (result.stderr.len > 0) {
+            std.debug.print("[error] ssh preflight failed\n{s}", .{result.stderr});
+        }
+        return error.CommandFailed;
+    }
+}
+
+fn runBatchCommandWithRecovery(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    remote_command: []const u8,
+    allow_host_key_recovery: bool,
+) !exec.Result {
     const connection = try prepareConnection(allocator, machine);
     defer connection.deinit(allocator);
     const wrapped_command = try wrappedRemoteCommand(allocator, remote_command);
@@ -80,7 +104,16 @@ pub fn runBatchCommand(
     try appendCommonArgs(allocator, &args, connection, true, true);
     try args.appendSlice(allocator, &.{ "-T", connection.destination, wrapped_command });
 
-    return exec.run(allocator, args.items);
+    var result = try exec.run(allocator, args.items);
+    if (allow_host_key_recovery and !result.succeeded() and isHostKeyMismatch(result.stderr)) {
+        result.deinit(allocator);
+        if (try clearKnownHostAlias(allocator, machine)) {
+            std.debug.print("[warn] cleared stale SSH host key for machine '{s}' and retried\n", .{machine.name});
+        }
+        return runBatchCommandWithRecovery(allocator, machine, remote_command, false);
+    }
+
+    return result;
 }
 
 pub fn uploadFile(
@@ -89,6 +122,8 @@ pub fn uploadFile(
     local_path: []const u8,
     remote_path: []const u8,
 ) !void {
+    try preflight(allocator, machine);
+
     const connection = try prepareConnection(allocator, machine);
     defer connection.deinit(allocator);
 
@@ -121,6 +156,8 @@ pub fn openInteractive(
     allocator: std.mem.Allocator,
     machine: model.MachineRecord,
 ) !std.process.Child.Term {
+    try preflight(allocator, machine);
+
     const connection = try prepareConnection(allocator, machine);
     defer connection.deinit(allocator);
 
@@ -139,6 +176,8 @@ pub fn openInteractiveCommand(
     machine: model.MachineRecord,
     remote_command: []const u8,
 ) !std.process.Child.Term {
+    try preflight(allocator, machine);
+
     const connection = try prepareConnection(allocator, machine);
     defer connection.deinit(allocator);
     const wrapped_command = try wrappedRemoteCommand(allocator, remote_command);
@@ -296,10 +335,40 @@ fn appendOpenSshOptions(
     }
 }
 
+fn clearKnownHostAlias(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+) !bool {
+    const known_hosts_path = try paths.defaultKnownHostsPath(allocator);
+    defer allocator.free(known_hosts_path);
+
+    std.fs.cwd().access(known_hosts_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+
+    const result = try exec.run(allocator, &.{
+        "ssh-keygen",
+        "-R",
+        machine.id,
+        "-f",
+        known_hosts_path,
+    });
+    defer result.deinit(allocator);
+
+    return result.succeeded();
+}
+
+fn isHostKeyMismatch(stderr: []const u8) bool {
+    return std.mem.indexOf(u8, stderr, "Host key verification failed") != null or
+        std.mem.indexOf(u8, stderr, "REMOTE HOST IDENTIFICATION HAS CHANGED") != null or
+        std.mem.indexOf(u8, stderr, "Offending ED25519 key") != null or
+        std.mem.indexOf(u8, stderr, "host key for") != null;
+}
+
 fn isFatalFailure(stderr: []const u8) bool {
     return std.mem.indexOf(u8, stderr, "Permission denied") != null or
-        std.mem.indexOf(u8, stderr, "Host key verification failed") != null or
-        std.mem.indexOf(u8, stderr, "REMOTE HOST IDENTIFICATION HAS CHANGED") != null or
+        isHostKeyMismatch(stderr) or
         std.mem.indexOf(u8, stderr, "Too many authentication failures") != null;
 }
 
@@ -307,4 +376,10 @@ test "treat authentication issues as fatal" {
     try std.testing.expect(isFatalFailure("Permission denied (publickey).\n"));
     try std.testing.expect(isFatalFailure("Host key verification failed.\n"));
     try std.testing.expect(!isFatalFailure("ssh: connect to host devbox.fly.dev port 22: Connection refused\n"));
+}
+
+test "detect stale host key failures" {
+    try std.testing.expect(isHostKeyMismatch("Host key verification failed.\n"));
+    try std.testing.expect(isHostKeyMismatch("Offending ED25519 key in /tmp/known_hosts:1\n"));
+    try std.testing.expect(!isHostKeyMismatch("Permission denied (publickey).\n"));
 }

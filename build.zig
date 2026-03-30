@@ -30,4 +30,10 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    const integration_cmd = b.addSystemCommand(&.{ "bash", "scripts/integration-smoke.sh" });
+    integration_cmd.addFileArg(exe.getEmittedBin());
+
+    const integration_step = b.step("integration", "Run the scripted integration smoke test");
+    integration_step.dependOn(&integration_cmd.step);
 }

@@ -1,6 +1,9 @@
 const std = @import("std");
+const auth = @import("auth.zig");
 const bootstrap = @import("bootstrap.zig");
 const config = @import("config.zig");
+const exec = @import("exec.zig");
+const keys = @import("keys.zig");
 const model = @import("model.zig");
 const paths = @import("paths.zig");
 const profile = @import("profile.zig");
@@ -35,10 +38,18 @@ pub const RefreshCommand = struct {
     prune_missing: bool = false,
 };
 
+pub const DoctorCommand = struct {
+    machine_name: ?[]const u8 = null,
+};
+
 pub const AdoptCommand = struct {
     target: []const u8,
     machine_id: []const u8,
     name: ?[]const u8 = null,
+};
+
+pub const AuthCommand = struct {
+    machine_name: []const u8,
 };
 
 pub const PullCommand = struct {
@@ -57,7 +68,9 @@ pub const Command = union(enum) {
     help,
     status,
     refresh: RefreshCommand,
+    doctor: DoctorCommand,
     adopt: AdoptCommand,
+    auth: AuthCommand,
     run: RunCommand,
     sync: SyncCommand,
     pull: PullCommand,
@@ -86,7 +99,9 @@ pub fn run(
         .help => try printHelp(stdout),
         .status => try handleStatus(allocator, stdout, stderr),
         .refresh => |refresh_command| try handleRefresh(allocator, stdout, stderr, refresh_command),
+        .doctor => |doctor_command| try handleDoctor(allocator, stdout, stderr, doctor_command),
         .adopt => |adopt_command| try handleAdopt(allocator, stdout, stderr, adopt_command),
+        .auth => |auth_command| try handleAuth(allocator, stdout, stderr, auth_command),
         .run => |target| try handleRun(allocator, stdout, stderr, target),
         .sync => |target| try handleSync(allocator, stdout, stderr, target),
         .pull => |pull_command| try handlePull(allocator, stdout, stderr, pull_command),
@@ -113,8 +128,16 @@ pub fn parse(args: []const []const u8) ParseError!Command {
         return .{ .refresh = try parseRefreshCommand(args) };
     }
 
+    if (std.mem.eql(u8, args[0], "doctor")) {
+        return .{ .doctor = try parseDoctorCommand(args) };
+    }
+
     if (std.mem.eql(u8, args[0], "adopt")) {
         return .{ .adopt = try parseAdoptCommand(args) };
+    }
+
+    if (std.mem.eql(u8, args[0], "auth")) {
+        return .{ .auth = try parseAuthCommand(args) };
     }
 
     if (std.mem.eql(u8, args[0], "sync")) {
@@ -202,6 +225,14 @@ fn parseRefreshCommand(args: []const []const u8) ParseError!RefreshCommand {
     return command;
 }
 
+fn parseDoctorCommand(args: []const []const u8) ParseError!DoctorCommand {
+    if (args.len > 2) return error.InvalidArguments;
+
+    return .{
+        .machine_name = if (args.len == 2) args[1] else null,
+    };
+}
+
 fn parseAdoptCommand(args: []const []const u8) ParseError!AdoptCommand {
     if (args.len < 3) return error.InvalidArguments;
     if (args[1].len == 0 or args[2].len == 0) return error.InvalidArguments;
@@ -226,6 +257,15 @@ fn parseAdoptCommand(args: []const []const u8) ParseError!AdoptCommand {
     }
 
     return command;
+}
+
+fn parseAuthCommand(args: []const []const u8) ParseError!AuthCommand {
+    if (args.len != 2) return error.InvalidArguments;
+    if (args[1].len == 0) return error.InvalidArguments;
+
+    return .{
+        .machine_name = args[1],
+    };
 }
 
 fn parsePullCommand(args: []const []const u8) ParseError!PullCommand {
@@ -328,7 +368,9 @@ pub fn printHelp(writer: anytype) !void {
         \\
         \\Usage:
         \\  rove refresh [name] [--prune-missing]
+        \\  rove doctor [name]
         \\  rove adopt <target> <machine-id> [--name <name>]
+        \\  rove auth <name>
         \\  rove run <target> [--name <name>]
         \\  rove sync <name> [--preview] [--delete]
         \\  rove pull <name> [--workspace <selector>] [--preview] [--force]
@@ -359,7 +401,9 @@ pub fn printHelp(writer: anytype) !void {
         \\  if omitted, the target name is used
         \\  `refresh` updates local state from the provider for one machine or all machines
         \\  `refresh --prune-missing` removes tracked machines that no longer exist remotely
+        \\  `doctor` checks local prerequisites, pinned images, auth material, and tracked machine health
         \\  `adopt` imports an existing provider machine into local state
+        \\  `auth` installs Rove's GitHub access material on the remote machine without relying on agent forwarding
         \\  `sync`, `pull`, `workspaces`, `offload`, `ssh`, and `down` address the tracked instance name
         \\  `sync --preview` shows rsync changes to the remote workspace without writing files
         \\  `sync --delete` removes remote files that no longer exist locally
@@ -502,6 +546,149 @@ fn handleRefresh(
     if (had_failures) {
         try stderr.writeAll("[warn] some tracked machines could not be refreshed cleanly\n");
     }
+}
+
+fn handleDoctor(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    stderr: anytype,
+    command: DoctorCommand,
+) !void {
+    try stdout.writeAll("CHECK\tSTATUS\tDETAILS\n");
+
+    var has_errors = false;
+
+    doctorExecCheck(allocator, stdout, "flyctl", &.{ "flyctl", "version" }, "flyctl is available", &has_errors);
+    doctorExecCheck(allocator, stdout, "fly auth", &.{ "flyctl", "auth", "whoami" }, "Fly auth is configured", &has_errors);
+
+    var loaded_config = config.load(allocator, null) catch |err| switch (err) {
+        error.FileNotFound => {
+            has_errors = true;
+            try printDoctorRow(stdout, "config", "error", "missing rove.json");
+            return error.HandledFailure;
+        },
+        else => return err,
+    };
+    defer loaded_config.deinit();
+
+    try printDoctorRow(stdout, "config", "ok", "loaded rove.json");
+    for (loaded_config.value.targets) |target| {
+        const detail = try std.fmt.allocPrint(allocator, "{s}: {s}", .{
+            target.name,
+            if (isPinnedImageRef(target.image)) "pinned image ref" else "unpinned image ref",
+        });
+        defer allocator.free(detail);
+
+        try printDoctorRow(
+            stdout,
+            "image",
+            if (isPinnedImageRef(target.image)) "ok" else "warn",
+            detail,
+        );
+    }
+
+    const managed_key = keys.ensureManagedKeyPair(allocator) catch |err| {
+        has_errors = true;
+        try printDoctorRow(stdout, "machine ssh key", "error", @errorName(err));
+        return error.HandledFailure;
+    };
+    defer managed_key.deinit(allocator);
+    try printDoctorRow(stdout, "machine ssh key", "ok", "managed machine SSH key is present");
+
+    const git_auth_key = keys.ensureGitAuthKeyPair(allocator) catch |err| {
+        has_errors = true;
+        try printDoctorRow(stdout, "git auth key", "error", @errorName(err));
+        return error.HandledFailure;
+    };
+    defer git_auth_key.deinit(allocator);
+    try printDoctorRow(stdout, "git auth key", "ok", "dedicated Git auth SSH key is present");
+
+    const local_gh_auth = try auth.localGhAuthAvailable(allocator);
+    try printDoctorRow(
+        stdout,
+        "gh auth",
+        if (local_gh_auth) "ok" else "warn",
+        if (local_gh_auth)
+            "local GitHub CLI auth is available"
+        else
+            "local gh auth not found; `rove auth <name>` will only install SSH Git auth",
+    );
+
+    var loaded_state = try state.loadOrEmpty(allocator, null);
+    defer loaded_state.deinit();
+
+    if (loaded_state.value.machines.len == 0) {
+        try printDoctorRow(stdout, "tracked machines", "ok", "no tracked machines");
+    } else if (command.machine_name) |machine_name| {
+        const machine = state.findMachine(&loaded_state.value, machine_name) orelse {
+            has_errors = true;
+            try printDoctorRow(stdout, "tracked machine", "error", "requested machine is not tracked");
+            return error.HandledFailure;
+        };
+        try doctorTrackedMachine(allocator, stdout, machine.*, &has_errors);
+    } else {
+        for (loaded_state.value.machines) |machine| {
+            try doctorTrackedMachine(allocator, stdout, machine, &has_errors);
+        }
+    }
+
+    if (has_errors) {
+        try stderr.writeAll("[warn] doctor found one or more errors\n");
+        return error.HandledFailure;
+    }
+}
+
+fn handleAuth(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    stderr: anytype,
+    command: AuthCommand,
+) !void {
+    var loaded_state = try state.loadOrEmpty(allocator, null);
+    defer loaded_state.deinit();
+
+    const machine = state.findMachine(&loaded_state.value, command.machine_name) orelse {
+        try std.fmt.format(
+            stderr,
+            "[error] no tracked machine named '{s}'\n" ++
+                "[hint] run or adopt a machine before syncing auth\n",
+            .{command.machine_name},
+        );
+        return error.HandledFailure;
+    };
+
+    const result = auth.syncGitHubAccess(allocator, machine.*) catch |err| {
+        try std.fmt.format(
+            stderr,
+            "[error] failed to sync remote auth for machine '{s}': {s}\n",
+            .{ command.machine_name, @errorName(err) },
+        );
+        return error.HandledFailure;
+    };
+    defer result.deinit(allocator);
+
+    try std.fmt.format(
+        stdout,
+        "[info] installed Git auth material on machine '{s}'\n" ++
+            "[info] local private repos over SSH will use ~/.ssh/rove_git_ed25519 on the remote box\n",
+        .{command.machine_name},
+    );
+
+    if (result.gh_config_synced) {
+        try stdout.writeAll("[info] synced local gh auth config to the remote machine\n");
+    } else {
+        try stdout.writeAll("[warn] local gh auth config was not found; only SSH Git auth was installed\n");
+    }
+
+    if (result.git_identity_synced) {
+        try stdout.writeAll("[info] synced local global git identity to the remote machine\n");
+    }
+
+    try std.fmt.format(
+        stdout,
+        "[hint] add this public key to GitHub once if private SSH remotes fail:\n{s}\n",
+        .{result.public_key},
+    );
 }
 
 fn handleAdopt(
@@ -1482,6 +1669,95 @@ fn refreshAndReportMachine(
     );
 }
 
+fn doctorTrackedMachine(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    machine: model.MachineRecord,
+    has_errors: *bool,
+) !void {
+    var refreshed = refreshMachineFromProvider(allocator, machine) catch |err| {
+        has_errors.* = true;
+        const detail = try std.fmt.allocPrint(allocator, "{s}: refresh failed: {s}", .{ machine.name, @errorName(err) });
+        defer allocator.free(detail);
+        try printDoctorRow(stdout, "machine", "error", detail);
+        return;
+    };
+    defer refreshed.deinit(allocator);
+
+    try state.upsertMachine(allocator, refreshed.value, null);
+
+    const remote_detail = try std.fmt.allocPrint(allocator, "{s}: remote state {s}", .{
+        machine.name,
+        refreshed.value.remote_state orelse "unknown",
+    });
+    defer allocator.free(remote_detail);
+
+    if (refreshed.missing) {
+        has_errors.* = true;
+        try printDoctorRow(stdout, "machine", "warn", remote_detail);
+        return;
+    }
+
+    try printDoctorRow(stdout, "machine", "ok", remote_detail);
+
+    ssh.preflight(allocator, refreshed.value) catch |err| {
+        has_errors.* = true;
+        const detail = try std.fmt.allocPrint(allocator, "{s}: ssh preflight failed: {s}", .{ machine.name, @errorName(err) });
+        defer allocator.free(detail);
+        try printDoctorRow(stdout, "ssh", "error", detail);
+        return;
+    };
+
+    const ssh_detail = try std.fmt.allocPrint(allocator, "{s}: SSH is reachable", .{machine.name});
+    defer allocator.free(ssh_detail);
+    try printDoctorRow(stdout, "ssh", "ok", ssh_detail);
+}
+
+fn doctorExecCheck(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    check_name: []const u8,
+    argv: []const []const u8,
+    ok_detail: []const u8,
+    has_errors: *bool,
+) void {
+    const result = exec.run(allocator, argv) catch |err| {
+        has_errors.* = true;
+        const detail = std.fmt.allocPrint(allocator, "{s}: {s}", .{ check_name, @errorName(err) }) catch return;
+        defer allocator.free(detail);
+        printDoctorRow(stdout, check_name, "error", detail) catch {};
+        return;
+    };
+    defer result.deinit(allocator);
+
+    if (!result.succeeded()) {
+        has_errors.* = true;
+        const stderr = std.mem.trim(u8, result.stderr, "\r\n\t ");
+        const detail = if (stderr.len > 0)
+            std.fmt.allocPrint(allocator, "{s}: {s}", .{ check_name, stderr }) catch return
+        else
+            std.fmt.allocPrint(allocator, "{s}: command failed", .{check_name}) catch return;
+        defer allocator.free(detail);
+        printDoctorRow(stdout, check_name, "error", detail) catch {};
+        return;
+    }
+
+    printDoctorRow(stdout, check_name, "ok", ok_detail) catch {};
+}
+
+fn printDoctorRow(
+    stdout: anytype,
+    check_name: []const u8,
+    status: []const u8,
+    detail: []const u8,
+) !void {
+    try std.fmt.format(stdout, "{s}\t{s}\t{s}\n", .{ check_name, status, detail });
+}
+
+fn isPinnedImageRef(image: []const u8) bool {
+    return std.mem.indexOf(u8, image, "@sha256:") != null;
+}
+
 fn lifecycleFromRemoteState(
     remote_state: ?[]const u8,
     fallback: model.LifecycleStatus,
@@ -1760,6 +2036,15 @@ test "parse refresh target" {
     }
 }
 
+test "parse doctor target" {
+    const command = try parse(&.{ "doctor", "sam-east" });
+
+    switch (command) {
+        .doctor => |doctor_command| try std.testing.expectEqualStrings("sam-east", doctor_command.machine_name.?),
+        else => return error.InvalidArguments,
+    }
+}
+
 test "parse adopt target" {
     const command = try parse(&.{ "adopt", "devbox", "machine-123", "--name", "sam-east" });
 
@@ -1769,6 +2054,15 @@ test "parse adopt target" {
             try std.testing.expectEqualStrings("machine-123", adopt_command.machine_id);
             try std.testing.expectEqualStrings("sam-east", adopt_command.name.?);
         },
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse auth target" {
+    const command = try parse(&.{ "auth", "sam-east" });
+
+    switch (command) {
+        .auth => |auth_command| try std.testing.expectEqualStrings("sam-east", auth_command.machine_name),
         else => return error.InvalidArguments,
     }
 }

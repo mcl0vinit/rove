@@ -10,6 +10,7 @@ This directory defines the first Fly-based Rove substrate: a small CPU devbox im
 - keep the base image focused on remote-dev primitives:
   - `nix`
   - `git`
+  - `gh`
   - `tmux`
   - `openssh`
   - `rsync`
@@ -106,6 +107,12 @@ fly deploy
 
 The image is pinned to a specific dotfiles commit in `Dockerfile` via `DOTFILES_REF`. When you want a newer baseline baked in, update that ref and rebuild the image.
 
+Rove target configs should also pin the resulting image ref by digest. The repo helper for that is:
+
+```bash
+./scripts/pin-image-ref.sh devbox 'registry.fly.io/mcl0vinit-devbox:latest@sha256:<digest>'
+```
+
 ## Access modes
 
 ### Normal SSH
@@ -140,7 +147,7 @@ The default `devbox` target now assumes dotfiles are already in the image, so it
   "name": "devbox",
   "provider": "fly",
   "app": "mcl0vinit-devbox",
-  "image": "registry.fly.io/mcl0vinit-devbox:deployment-<id>",
+  "image": "registry.fly.io/mcl0vinit-devbox:latest@sha256:<digest>",
   "vm_size": "shared-cpu-2x",
   "ssh_user": "rove",
   "startup_script": "./scripts/bootstrap.sh"

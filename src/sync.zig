@@ -324,6 +324,8 @@ fn runRsync(
     destination: []const u8,
     options: RsyncOptions,
 ) !exec.Result {
+    try ssh.preflight(allocator, machine);
+
     const transport = try ssh.rsyncTransportCommand(allocator, machine);
     defer allocator.free(transport);
 
