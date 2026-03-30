@@ -50,6 +50,7 @@ pub const AdoptCommand = struct {
 
 pub const AuthCommand = struct {
     machine_name: []const u8,
+    copy_gh: bool = false,
 };
 
 pub const PullCommand = struct {
@@ -260,12 +261,26 @@ fn parseAdoptCommand(args: []const []const u8) ParseError!AdoptCommand {
 }
 
 fn parseAuthCommand(args: []const []const u8) ParseError!AuthCommand {
-    if (args.len != 2) return error.InvalidArguments;
+    if (args.len < 2) return error.InvalidArguments;
     if (args[1].len == 0) return error.InvalidArguments;
 
-    return .{
+    var command = AuthCommand{
         .machine_name = args[1],
     };
+
+    var index: usize = 2;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--copy-gh")) {
+            if (command.copy_gh) return error.InvalidArguments;
+            command.copy_gh = true;
+            index += 1;
+            continue;
+        }
+
+        return error.InvalidArguments;
+    }
+
+    return command;
 }
 
 fn parsePullCommand(args: []const []const u8) ParseError!PullCommand {
@@ -370,7 +385,7 @@ pub fn printHelp(writer: anytype) !void {
         \\  rove refresh [name] [--prune-missing]
         \\  rove doctor [name]
         \\  rove adopt <target> <machine-id> [--name <name>]
-        \\  rove auth <name>
+        \\  rove auth <name> [--copy-gh]
         \\  rove run <target> [--name <name>]
         \\  rove sync <name> [--preview] [--delete]
         \\  rove pull <name> [--workspace <selector>] [--preview] [--force]
@@ -403,7 +418,8 @@ pub fn printHelp(writer: anytype) !void {
         \\  `refresh --prune-missing` removes tracked machines that no longer exist remotely
         \\  `doctor` checks local prerequisites, pinned images, auth material, and tracked machine health
         \\  `adopt` imports an existing provider machine into local state
-        \\  `auth` installs Rove's GitHub access material on the remote machine without relying on agent forwarding
+        \\  `auth` installs Rove's SSH Git access material on the remote machine without relying on agent forwarding
+        \\  `auth --copy-gh` also copies local GitHub CLI auth to the remote machine
         \\  `sync`, `pull`, `workspaces`, `offload`, `ssh`, and `down` address the tracked instance name
         \\  `sync --preview` shows rsync changes to the remote workspace without writing files
         \\  `sync --delete` removes remote files that no longer exist locally
@@ -607,11 +623,11 @@ fn handleDoctor(
     try printDoctorRow(
         stdout,
         "gh auth",
-        if (local_gh_auth) "ok" else "warn",
+        "ok",
         if (local_gh_auth)
-            "local GitHub CLI auth is available"
+            "local GitHub CLI auth is available for optional `rove auth <name> --copy-gh`"
         else
-            "local gh auth not found; `rove auth <name>` will only install SSH Git auth",
+            "local gh auth not found; remote gh auth sync is disabled unless explicitly requested",
     );
 
     var loaded_state = try state.loadOrEmpty(allocator, null);
@@ -657,7 +673,9 @@ fn handleAuth(
         return error.HandledFailure;
     };
 
-    const result = auth.syncGitHubAccess(allocator, machine.*) catch |err| {
+    const result = auth.syncGitHubAccess(allocator, machine.*, .{
+        .copy_gh_auth = command.copy_gh,
+    }) catch |err| {
         try std.fmt.format(
             stderr,
             "[error] failed to sync remote auth for machine '{s}': {s}\n",
@@ -674,10 +692,12 @@ fn handleAuth(
         .{command.machine_name},
     );
 
-    if (result.gh_config_synced) {
+    if (command.copy_gh and result.gh_config_synced) {
         try stdout.writeAll("[info] synced local gh auth config to the remote machine\n");
-    } else {
+    } else if (command.copy_gh) {
         try stdout.writeAll("[warn] local gh auth config was not found; only SSH Git auth was installed\n");
+    } else {
+        try stdout.writeAll("[info] skipped local gh auth sync; pass `--copy-gh` to copy GitHub CLI auth intentionally\n");
     }
 
     if (result.git_identity_synced) {
@@ -2062,7 +2082,22 @@ test "parse auth target" {
     const command = try parse(&.{ "auth", "sam-east" });
 
     switch (command) {
-        .auth => |auth_command| try std.testing.expectEqualStrings("sam-east", auth_command.machine_name),
+        .auth => |auth_command| {
+            try std.testing.expectEqualStrings("sam-east", auth_command.machine_name);
+            try std.testing.expect(!auth_command.copy_gh);
+        },
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse auth target with copy gh" {
+    const command = try parse(&.{ "auth", "sam-east", "--copy-gh" });
+
+    switch (command) {
+        .auth => |auth_command| {
+            try std.testing.expectEqualStrings("sam-east", auth_command.machine_name);
+            try std.testing.expect(auth_command.copy_gh);
+        },
         else => return error.InvalidArguments,
     }
 }

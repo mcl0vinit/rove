@@ -16,9 +16,14 @@ pub const SyncResult = struct {
     }
 };
 
+pub const SyncOptions = struct {
+    copy_gh_auth: bool = false,
+};
+
 pub fn syncGitHubAccess(
     allocator: std.mem.Allocator,
     machine: model.MachineRecord,
+    options: SyncOptions,
 ) !SyncResult {
     const git_key = try keys.ensureGitAuthKeyPair(allocator);
     defer git_key.deinit(allocator);
@@ -35,7 +40,10 @@ pub fn syncGitHubAccess(
     try ssh.uploadFile(allocator, machine, git_key.private_key_path, remote_private_key);
     try ssh.uploadFile(allocator, machine, git_key.public_key_path, remote_public_key);
 
-    const local_gh_hosts = try localGhHostsPath(allocator);
+    const local_gh_hosts = if (options.copy_gh_auth)
+        try localGhHostsPath(allocator)
+    else
+        null;
     defer if (local_gh_hosts) |path| allocator.free(path);
 
     const remote_gh_hosts = try std.fmt.allocPrint(allocator, "{s}/.config/gh/hosts.yml", .{remote_home});
@@ -65,6 +73,19 @@ pub fn syncGitHubAccess(
     const quoted_remote_gh_hosts = try shell.quote(allocator, remote_gh_hosts);
     defer allocator.free(quoted_remote_gh_hosts);
 
+    const gh_config_cmd = if (options.copy_gh_auth) try std.fmt.allocPrint(
+        allocator,
+        \\mkdir -p {0s}/.config/gh
+        \\if [[ -f {1s} ]]; then chmod 600 {1s}; fi
+        \\if command -v gh >/dev/null 2>&1 && [[ -f {1s} ]]; then
+        \\  gh auth setup-git >/dev/null 2>&1 || true
+        \\fi
+        \\
+    ,
+        .{ quoted_remote_home, quoted_remote_gh_hosts },
+    ) else try allocator.dupe(u8, "");
+    defer allocator.free(gh_config_cmd);
+
     const git_user_name_cmd = if (git_user_name) |value| cmd: {
         const quoted = try shell.quote(allocator, value);
         defer allocator.free(quoted);
@@ -81,7 +102,7 @@ pub fn syncGitHubAccess(
 
     const remote_command = try std.fmt.allocPrint(
         allocator,
-        \\mkdir -p {0s}/.ssh {0s}/.config/gh
+        \\mkdir -p {0s}/.ssh
         \\chmod 700 {0s}/.ssh
         \\touch {0s}/.ssh/config {0s}/.ssh/known_hosts
         \\chmod 600 {1s} {0s}/.ssh/config {0s}/.ssh/known_hosts
@@ -102,17 +123,13 @@ pub fn syncGitHubAccess(
         \\ssh-keyscan -H github.com >> {0s}/.ssh/known_hosts 2>/dev/null || true
         \\sort -u {0s}/.ssh/known_hosts -o {0s}/.ssh/known_hosts 2>/dev/null || true
         \\chmod 600 {0s}/.ssh/known_hosts
-        \\if [[ -f {3s} ]]; then chmod 600 {3s}; fi
-        \\if command -v gh >/dev/null 2>&1 && [[ -f {3s} ]]; then
-        \\  gh auth setup-git >/dev/null 2>&1 || true
-        \\fi
-        \\{4s}{5s}
+        \\{3s}{4s}{5s}
     ,
         .{
             quoted_remote_home,
             quoted_remote_private_key,
             quoted_remote_public_key,
-            quoted_remote_gh_hosts,
+            gh_config_cmd,
             git_user_name_cmd,
             git_user_email_cmd,
         },

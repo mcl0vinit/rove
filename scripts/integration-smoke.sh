@@ -188,6 +188,10 @@ assert_contains "${pull_output}" "no remote changes detected"
 
 auth_output="$(run_rove auth smoke)"
 assert_contains "${auth_output}" "installed Git auth material"
+assert_contains "${auth_output}" "skipped local gh auth sync"
+
+auth_copy_output="$(run_rove auth smoke --copy-gh)"
+assert_contains "${auth_copy_output}" "synced local gh auth config"
 
 touch "${tmpdir}/hostkey-once"
 doctor_output="$(run_rove doctor smoke)"

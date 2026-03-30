@@ -18,7 +18,7 @@ rove run <target> [--name <name>]
 rove status
 rove refresh [name] [--prune-missing]
 rove doctor [name]
-rove auth <name>
+rove auth <name> [--copy-gh]
 rove sync <name> [--preview] [--delete]
 rove workspaces <name>
 rove offload <name> [--workspace <selector>]
@@ -125,7 +125,7 @@ V1 is opinionated:
 - no SSH agent forwarding
 - no SSH port forwarding through the devbox
 - Git SSH access uses a dedicated Rove-managed Git key, not the machine access key
-- if local `gh` auth exists, `rove auth <name>` copies that config to the remote machine too
+- local `gh` auth is opt-in and is only copied when you pass `--copy-gh`
 
 Run:
 
@@ -133,10 +133,15 @@ Run:
 nix run . -- auth sam-east
 ```
 
-That does three things:
+That does two things by default:
 - uploads the dedicated Git auth key to `~/.ssh/rove_git_ed25519` on the remote box
 - installs a managed GitHub block in `~/.ssh/config`
-- copies local `gh` auth config if it exists
+
+If you explicitly want your local GitHub CLI auth copied to the box too:
+
+```bash
+nix run . -- auth sam-east --copy-gh
+```
 
 If private SSH Git remotes still fail, add the printed `rove-github` public key to GitHub once and rerun `rove auth <name>`.
 
