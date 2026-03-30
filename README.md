@@ -56,11 +56,11 @@ nix develop -c zig build test
 nix develop -c zig build integration
 ```
 
-2. Set up the Fly app and base image using [infra/fly/devbox/README.md](infra/fly/devbox/README.md#L1).
+2. Set up the Fly app and base image using [`infra/fly/devbox/README.md`](infra/fly/devbox/README.md).
 
 3. Confirm `rove.json` points at a pinned image ref, not plain `:latest`.
 
-The repo currently ships with a pinned working image ref in [rove.json](rove.json#L1) and [rove.example.json](rove.example.json#L1).
+The repo currently ships with a pinned working image ref in [`rove.json`](rove.json) and [`rove.example.json`](rove.example.json).
 
 ## Publishing and pinning the devbox image
 
@@ -77,7 +77,7 @@ After you know the new full image ref, update the target config with:
 ./scripts/pin-image-ref.sh devbox 'registry.fly.io/mcl0vinit-devbox:latest@sha256:<digest>'
 ```
 
-That updates both [rove.json](rove.json#L1) and [rove.example.json](rove.example.json#L1).
+That updates both [`rove.json`](rove.json) and [`rove.example.json`](rove.example.json).
 
 ## Normal workflow
 
