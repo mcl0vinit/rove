@@ -4,7 +4,7 @@
       "name": "devbox",
       "provider": "fly",
       "app": "mcl0vinit-devbox",
-      "image": "registry.fly.io/mcl0vinit-devbox:latest@sha256:3f33dc2178d7c24dbb63caf3d09dc5c3e084ca326b78f9be66f9f1729f4dec0f",
+      "image": "registry.fly.io/mcl0vinit-devbox:latest@sha256:e51829cc6f1962fafcc25bf2c0ac9ddc4aea893aade3d9c8787332838548f613",
       "vm_size": "shared-cpu-2x",
       "ssh_user": "rove",
       "startup_script": "./scripts/bootstrap.sh",
