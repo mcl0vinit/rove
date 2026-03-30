@@ -1,8 +1,10 @@
 # Rove
 
-Rove provisions a remote devbox, syncs a workspace into it, hands off tmux state, and pulls changes back later.
+Rove is an opinionated remote development loop.
 
-The current V1 focuses on one use case and doing it well:
+It does more than boot a machine and hand you a shell. It brings up a pinned devbox, syncs a repo into it, restores tmux context, reconnects you to work that already feels in-progress, and gives you recovery commands when local state and cloud state drift apart.
+
+The current V1 is narrow on purpose:
 - Fly Machines only
 - CPU devboxes only
 - one baked devbox image
@@ -11,14 +13,35 @@ The current V1 focuses on one use case and doing it well:
 - tmux handoff with either plain layout restore or a custom capture hook
 - locked-down SSH with no agent or port forwarding
 
-## What Rove Does
+## Why It Feels Different
 
-- starts an ephemeral remote machine from a pinned image
-- waits for SSH and runs a bootstrap script
-- syncs a local repo to the remote workspace
-- restores tmux layout and reconnects you to the session
-- tracks machine and workspace state locally
-- helps recover when local state and provider state drift
+- the remote machine is a real devbox, not a blank cloud instance
+- the image is pinned, so bring-up is reproducible
+- your shell/tmux workflow is part of the product, not an afterthought
+- `offload` is about moving working context, not just copying files
+- `doctor`, `refresh`, and `adopt` exist because remote development gets messy in practice
+- the security model is opinionated: locked-down SSH, separate Git auth, and opt-in `gh` auth sync
+
+## The Loop
+
+This is the core workflow:
+
+```bash
+rove run devbox --name work
+rove auth work
+rove sync work
+rove offload work
+```
+
+Later:
+
+```bash
+rove ssh work
+rove pull work
+rove down work
+```
+
+That is the point of Rove: bring a box up fast, move into it with context, reconnect cleanly, and tear it down without losing track of what happened.
 
 ## Install
 
