@@ -401,6 +401,8 @@ fn appendMachineJson(
     try appendJsonNullableString(out, machine.app);
     try out.writer.writeAll(",\"host\":");
     try appendJsonString(out, machine.host);
+    try out.writer.writeAll(",\"ssh_port\":");
+    try std.json.Stringify.value(machine.ssh_port, .{}, &out.writer);
     try out.writer.writeAll(",\"region\":");
     try appendJsonNullableString(out, machine.region);
     try out.writer.writeAll(",\"remote_state\":");
@@ -409,6 +411,12 @@ fn appendMachineJson(
     try appendJsonString(out, machine.ssh_user);
     try out.writer.writeAll(",\"status\":");
     try appendJsonString(out, model.statusName(machine.status));
+    try out.writer.writeAll(",\"provider_metadata\":");
+    if (machine.provider_metadata) |metadata| {
+        try std.json.Stringify.value(metadata, .{}, &out.writer);
+    } else {
+        try out.writer.writeAll("null");
+    }
     try out.writer.writeByte('}');
 }
 
@@ -491,7 +499,7 @@ fn handleList(
         return;
     }
 
-    try stdout.writeAll("NAME\tTARGET\tPROVIDER\tSTATUS\tREMOTE\tHOST\tREGION\n");
+    try stdout.writeAll("NAME\tTARGET\tPROVIDER\tSTATUS\tREMOTE\tSSH\tREGION\n");
     for (loaded_state.value.machines) |machine| {
         var refreshed = refreshMachineFromProvider(allocator, machine) catch |err| fallback: {
             try std.fmt.format(
@@ -563,14 +571,14 @@ fn handleInspect(
         return;
     }
 
-    try stdout.writeAll("NAME\tTARGET\tPROVIDER\tSTATUS\tREMOTE\tHOST\tREGION\n");
+    try stdout.writeAll("NAME\tTARGET\tPROVIDER\tSTATUS\tREMOTE\tSSH\tREGION\n");
     try printMachineRow(stdout, refreshed.value);
 }
 
 fn printMachineRow(stdout: anytype, machine: model.MachineRecord) !void {
     try std.fmt.format(
         stdout,
-        "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n",
+        "{s}\t{s}\t{s}\t{s}\t{s}\t{s}:{d}\t{s}\n",
         .{
             machine.name,
             machine.target_name orelse machine.name,
@@ -578,6 +586,7 @@ fn printMachineRow(stdout: anytype, machine: model.MachineRecord) !void {
             model.statusName(machine.status),
             machine.remote_state orelse "-",
             machine.host,
+            machine.ssh_port,
             machine.region orelse "-",
         },
     );
@@ -659,7 +668,7 @@ fn handleRefresh(
         return;
     }
 
-    try stdout.writeAll("NAME\tRESULT\tSTATUS\tREMOTE\tHOST\n");
+    try stdout.writeAll("NAME\tRESULT\tSTATUS\tREMOTE\tSSH\n");
 
     if (command.machine_name) |machine_name| {
         const machine = state.findMachine(&loaded_state.value, machine_name) orelse {
@@ -698,9 +707,6 @@ fn handleDoctor(
     try stdout.writeAll("CHECK\tSTATUS\tDETAILS\n");
 
     var has_errors = false;
-    doctorExecCheck(allocator, stdout, "flyctl", &.{ "flyctl", "version" }, "flyctl is available", &has_errors);
-    doctorExecCheck(allocator, stdout, "fly auth", &.{ "flyctl", "auth", "whoami" }, "Fly auth is configured", &has_errors);
-
     var loaded_config = config.load(allocator, null) catch |err| switch (err) {
         error.FileNotFound => {
             has_errors = true;
@@ -712,17 +718,29 @@ fn handleDoctor(
     defer loaded_config.deinit();
 
     try printDoctorRow(stdout, "config", "ok", "loaded rove.json");
-    for (loaded_config.value.targets) |target| {
-        const image_ref = switch (target.provider) {
-            .fly => config.resolveFlyTarget(target).image,
-        };
-        const detail = try std.fmt.allocPrint(allocator, "{s}: {s}", .{
-            target.name,
-            if (isPinnedImageRef(image_ref)) "pinned image ref" else "unpinned image ref",
-        });
-        defer allocator.free(detail);
 
-        try printDoctorRow(stdout, "image", if (isPinnedImageRef(image_ref)) "ok" else "warn", detail);
+    const provider_count = @typeInfo(model.ProviderKind).@"enum".fields.len;
+    var checked_providers = [_]bool{false} ** provider_count;
+
+    for (loaded_config.value.targets) |target| {
+        const provider_index: usize = @intFromEnum(target.provider);
+        if (!checked_providers[provider_index]) {
+            checked_providers[provider_index] = true;
+            for (provider.doctorChecks(target.provider)) |check| {
+                doctorExecCheck(allocator, stdout, check.name, check.argv, check.ok_detail, &has_errors);
+            }
+        }
+
+        const summary = provider.targetSummary(target);
+        if (summary.image) |image_ref| {
+            const detail = try std.fmt.allocPrint(allocator, "{s}: {s}", .{
+                target.name,
+                if (isPinnedImageRef(image_ref)) "pinned image ref" else "unpinned image ref",
+            });
+            defer allocator.free(detail);
+
+            try printDoctorRow(stdout, "image", if (isPinnedImageRef(image_ref)) "ok" else "warn", detail);
+        }
     }
 
     const managed_key = keys.ensureManagedKeyPair(allocator) catch |err| {
@@ -840,9 +858,21 @@ fn handleAdopt(
         return error.HandledFailure;
     }
 
-    const fly_config = target_provider_config.fly;
-    const fallback_host = try std.fmt.allocPrint(allocator, "{s}.fly.dev", .{fly_config.app});
-    defer allocator.free(fallback_host);
+    const fallback_host = try provider.fallbackHost(allocator, target_provider_config);
+    defer {
+        if (fallback_host) |host| allocator.free(host);
+    }
+
+    const adopted_host = inspected.host orelse fallback_host orelse {
+        try std.fmt.format(
+            stderr,
+            "[error] provider did not return an SSH host for machine '{s}'\n",
+            .{command.machine_id},
+        );
+        return error.HandledFailure;
+    };
+
+    const summary = provider.targetSummary(target.*);
 
     const machine = model.MachineRecord{
         .name = adopted_name,
@@ -850,9 +880,10 @@ fn handleAdopt(
         .provider = target.provider,
         .id = command.machine_id,
         .machine_name = inspected.machine_name,
-        .provider_scope = fly_config.app,
-        .app = fly_config.app,
-        .host = inspected.host orelse fallback_host,
+        .provider_scope = provider.scopeForConfig(target_provider_config),
+        .app = provider.legacyAppAliasForConfig(target_provider_config),
+        .host = adopted_host,
+        .ssh_port = inspected.ssh_port orelse 22,
         .region = inspected.region,
         .remote_state = inspected.remote_state,
         .ssh_user = target.ssh_user,
@@ -871,16 +902,19 @@ fn handleAdopt(
         "[info] adopted machine '{s}' as instance '{s}'\n" ++
             "[info] target: {s}\n" ++
             "[info] provider: {s}\n" ++
-            "[info] app: {s}\n" ++
-            "[info] host: {s}\n" ++
+            "[info] {s}: {s}\n" ++
+            "[info] ssh: {s}@{s}:{d}\n" ++
             "[info] remote_state: {s}\n",
         .{
             command.machine_id,
             adopted_name,
             target.name,
             model.providerName(target.provider),
-            fly_config.app,
+            summary.scope_label,
+            summary.scope orelse "-",
+            machine.ssh_user,
             machine.host,
+            machine.ssh_port,
             machine.remote_state orelse "unknown",
         },
     );
@@ -944,8 +978,8 @@ fn handleRun(
     };
 
     const target_provider_config = providerConfigForTarget(target.*);
-    const fly_config = target_provider_config.fly;
-    const placement = try renderPlacementSummary(allocator, target.*);
+    const summary = provider.targetSummary(target.*);
+    const placement = try provider.renderPlacementSummary(allocator, target.*);
     defer allocator.free(placement);
 
     const created = provider.create(allocator, target.provider, .{
@@ -968,9 +1002,10 @@ fn handleRun(
         .provider = target.provider,
         .id = created.machine_id,
         .machine_name = created.machine_name,
-        .provider_scope = fly_config.app,
-        .app = fly_config.app,
+        .provider_scope = provider.scopeForConfig(target_provider_config),
+        .app = provider.legacyAppAliasForConfig(target_provider_config),
         .host = created.host,
+        .ssh_port = created.ssh_port,
         .region = created.region,
         .ssh_user = target.ssh_user,
         .status = .provisioned,
@@ -983,22 +1018,26 @@ fn handleRun(
             stdout,
             "[info] instance '{s}' created from target '{s}'\n" ++
                 "[info] provider: {s}\n" ++
-                "[info] app: {s}\n" ++
+                "[info] {s}: {s}\n" ++
                 "[info] machine_id: {s}\n" ++
                 "[info] image: {s}\n" ++
-                "[info] vm_size: {s}\n" ++
+                "[info] {s}: {s}\n" ++
                 "[info] placement: {s}\n" ++
-                "[info] host: {s}\n",
+                "[info] ssh: {s}@{s}:{d}\n",
             .{
                 machine.name,
                 target.name,
                 model.providerName(target.provider),
-                fly_config.app,
+                summary.scope_label,
+                summary.scope orelse "-",
                 created.machine_id,
-                fly_config.image,
-                fly_config.vm_size,
+                summary.image orelse "-",
+                summary.size_label,
+                summary.size orelse "-",
                 placement,
+                machine.ssh_user,
                 created.host,
+                created.ssh_port,
             },
         );
     }
@@ -1009,8 +1048,8 @@ fn handleRun(
     if (command.format == .human) {
         try std.fmt.format(
             stdout,
-            "[info] waiting for SSH on {s}@{s}\n",
-            .{ machine.ssh_user, machine.host },
+            "[info] waiting for SSH on {s}@{s}:{d}\n",
+            .{ machine.ssh_user, machine.host, machine.ssh_port },
         );
     }
 
@@ -1248,28 +1287,6 @@ fn renderRemoteCommand(
     return allocator.dupe(u8, writer.written());
 }
 
-fn renderPlacementSummary(
-    allocator: std.mem.Allocator,
-    target: model.TargetConfig,
-) ![]u8 {
-    switch (target.provider) {
-        .fly => {
-            const fly_config = config.resolveFlyTarget(target);
-            if (fly_config.region) |region| {
-                return std.fmt.allocPrint(allocator, "fixed region {s}", .{region});
-            }
-
-            if (fly_config.region_preference) |preference| {
-                const joined = try std.mem.join(allocator, ",", preference);
-                defer allocator.free(joined);
-                return std.fmt.allocPrint(allocator, "flexible preference {s}", .{joined});
-            }
-        },
-    }
-
-    return allocator.dupe(u8, "runtime-selected region");
-}
-
 const RefreshedMachine = struct {
     value: model.MachineRecord,
     missing: bool = false,
@@ -1326,6 +1343,9 @@ fn refreshMachineFromProvider(
     if (inspected.host) |host| {
         refreshed.value.host = host;
         refreshed.owned_host = host;
+    }
+    if (inspected.ssh_port) |ssh_port| {
+        refreshed.value.ssh_port = ssh_port;
     }
     if (inspected.region) |region| {
         refreshed.value.region = region;
@@ -1397,13 +1417,14 @@ fn refreshAndReportMachine(
 
     try std.fmt.format(
         stdout,
-        "{s}\t{s}\t{s}\t{s}\t{s}\n",
+        "{s}\t{s}\t{s}\t{s}\t{s}:{d}\n",
         .{
             machine.name,
             report.result,
             model.statusName(report.refreshed.value.status),
             report.refreshed.value.remote_state orelse "-",
             report.refreshed.value.host,
+            report.refreshed.value.ssh_port,
         },
     );
 }
@@ -1447,7 +1468,11 @@ fn doctorTrackedMachine(
         return;
     };
 
-    const ssh_detail = try std.fmt.allocPrint(allocator, "{s}: SSH is reachable", .{machine.name});
+    const ssh_detail = try std.fmt.allocPrint(allocator, "{s}: SSH is reachable on {s}:{d}", .{
+        machine.name,
+        refreshed.value.host,
+        refreshed.value.ssh_port,
+    });
     defer allocator.free(ssh_detail);
     try printDoctorRow(stdout, "ssh", "ok", ssh_detail);
 }

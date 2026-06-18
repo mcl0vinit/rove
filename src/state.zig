@@ -177,6 +177,7 @@ test "find machine by name" {
 
     const machine = findMachine(&parsed.value, "cpu").?;
     try std.testing.expectEqualStrings("machine-1", machine.id);
+    try std.testing.expectEqual(@as(u16, 22), machine.ssh_port);
 }
 
 test "upsert and remove machine in saved state" {

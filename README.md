@@ -106,7 +106,7 @@ rove down <name> [--json]
 
 ## Script Contract
 
-Rove's script-facing API is JSON on stdout and errors/warnings on stderr.
+Rove's script-facing API is JSON on stdout and errors/warnings on stderr. The normalized SSH endpoint is `ssh_user`, `host`, and `ssh_port`; provider-specific details can live in `provider_metadata`.
 
 Machine-list commands return:
 
@@ -122,10 +122,12 @@ Machine-list commands return:
       "provider_scope": "your-fly-app",
       "app": "your-fly-app",
       "host": "your-fly-app.fly.dev",
+      "ssh_port": 22,
       "region": "iad",
       "remote_state": "started",
       "ssh_user": "rove",
-      "status": "ready"
+      "status": "ready",
+      "provider_metadata": null
     }
   ]
 }
@@ -144,10 +146,12 @@ Single-machine commands return:
     "provider_scope": "your-fly-app",
     "app": "your-fly-app",
     "host": "your-fly-app.fly.dev",
+    "ssh_port": 22,
     "region": "iad",
     "remote_state": "started",
     "ssh_user": "rove",
-    "status": "ready"
+    "status": "ready",
+    "provider_metadata": null
   }
 }
 ```

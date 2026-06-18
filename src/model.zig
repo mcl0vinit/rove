@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub const ProviderKind = enum {
     fly,
 };
@@ -47,10 +49,12 @@ pub const MachineRecord = struct {
     provider_scope: ?[]const u8 = null,
     app: ?[]const u8 = null,
     host: []const u8,
+    ssh_port: u16 = 22,
     region: ?[]const u8 = null,
     remote_state: ?[]const u8 = null,
     ssh_user: []const u8,
     status: LifecycleStatus,
+    provider_metadata: ?std.json.Value = null,
 };
 
 pub const StateFile = struct {

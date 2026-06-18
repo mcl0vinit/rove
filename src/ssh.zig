@@ -13,12 +13,14 @@ const ConnectionParts = struct {
     destination: []u8,
     user_known_hosts: []u8,
     host_key_alias: []u8,
+    port_option: []u8,
     identity_file: []u8,
 
     fn deinit(self: ConnectionParts, allocator: std.mem.Allocator) void {
         allocator.free(self.destination);
         allocator.free(self.user_known_hosts);
         allocator.free(self.host_key_alias);
+        allocator.free(self.port_option);
         allocator.free(self.identity_file);
     }
 };
@@ -221,6 +223,11 @@ fn prepareConnection(
     });
     errdefer allocator.free(host_key_alias);
 
+    const port_option = try std.fmt.allocPrint(allocator, "Port={d}", .{
+        machine.ssh_port,
+    });
+    errdefer allocator.free(port_option);
+
     const identity_file = try paths.defaultManagedPrivateKeyPath(allocator);
     errdefer allocator.free(identity_file);
 
@@ -228,6 +235,7 @@ fn prepareConnection(
         .destination = destination,
         .user_known_hosts = user_known_hosts,
         .host_key_alias = host_key_alias,
+        .port_option = port_option,
         .identity_file = identity_file,
     };
 }
@@ -281,6 +289,8 @@ fn appendOpenSshOptions(
         connection.user_known_hosts,
         "-o",
         connection.host_key_alias,
+        "-o",
+        connection.port_option,
         "-o",
         "ConnectTimeout=5",
     });

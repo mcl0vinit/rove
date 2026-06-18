@@ -172,13 +172,13 @@ list_output="$(run_rove list)"
 assert_contains "${list_output}" $'smoke\tdevbox\tfly\tready'
 
 list_json="$(run_rove list --json)"
-assert_json "${list_json}" '.machines[0].name == "smoke" and .machines[0].provider == "fly" and .machines[0].provider_scope == "fake-devbox" and .machines[0].status == "ready"'
+assert_json "${list_json}" '.machines[0].name == "smoke" and .machines[0].provider == "fly" and .machines[0].provider_scope == "fake-devbox" and .machines[0].ssh_port == 22 and .machines[0].provider_metadata == null and .machines[0].status == "ready"'
 
 status_output="$(run_rove status smoke)"
 assert_contains "${status_output}" $'smoke\tdevbox\tfly\tready'
 
 inspect_json="$(run_rove inspect smoke --json)"
-assert_json "${inspect_json}" '.machine.name == "smoke" and .machine.target_name == "devbox" and .machine.status == "ready"'
+assert_json "${inspect_json}" '.machine.name == "smoke" and .machine.target_name == "devbox" and .machine.ssh_port == 22 and .machine.status == "ready"'
 
 run_rove exec smoke -- true >/dev/null
 
