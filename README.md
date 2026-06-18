@@ -2,7 +2,7 @@
 
 Rove provisions and tracks disposable remote machines.
 
-It is intentionally smaller than the original remote-development loop. Rove owns machine lifecycle, SSH reachability, bootstrap, provider reconciliation, and teardown. Workspace sync, tmux context movement, distributed search, and live control belong above this layer, especially in Mesh.
+Rove owns machine lifecycle, SSH reachability, bootstrap, provider reconciliation, and teardown. It deliberately does not own workspace sync, terminal session state, distributed search, or higher-level control-plane UX.
 
 The current V1 is narrow on purpose:
 - Fly Machines only
@@ -152,7 +152,7 @@ Single-machine commands return:
 }
 ```
 
-Prefer `rove inspect <name> --json` for scripts and future Mesh integration.
+Prefer `rove inspect <name> --json` for scripts and higher-level automation.
 
 ## Security Model
 
@@ -205,18 +205,18 @@ rove adopt devbox <machine-id> --name recovered
 - tracked machine reachability
 - stale SSH host keys, with automatic cleanup and retry
 
-## Mesh Boundary
+## Boundaries
 
 Rove should stay the provider-backed machine launcher.
 
-Mesh should own:
-- tmux control
-- repo/port/pane indexing
-- distributed grep
-- live status across Tailscale nodes
-- routing and jump UX
+Rove should not own:
+- terminal session control
+- repo, port, or pane indexing
+- distributed grep/search
+- workspace sync or pull flows
+- public UI or cockpit behavior
 
-A future integration point should be narrow: Rove creates or adopts a machine, then Mesh discovers or registers it as a node.
+Higher-level tools should treat Rove as a backend: create or adopt a machine, inspect its machine record, then decide what to do with it.
 
 ## Building The Devbox Image
 

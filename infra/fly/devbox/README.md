@@ -1,13 +1,13 @@
 # Fly Devbox
 
-This directory defines the first Fly-based Rove substrate: a small CPU devbox image with Nix, SSH, and your baked-in `portable-linux` dotfiles baseline.
+This directory defines the first Fly-based Rove substrate: a small CPU machine image with Nix, SSH, and a portable terminal-tooling baseline.
 
 ## What this image is for
 
 - boot a ready-to-use remote machine quickly
 - let project-specific flakes define language runtimes and app dependencies
-- keep your portable shell, tmux, and editor defaults in the image instead of replaying Home Manager on every boot
-- keep the base image focused on remote-dev primitives:
+- keep portable shell/tooling defaults in the image instead of replaying Home Manager on every boot
+- keep the base image focused on machine-access primitives:
   - `nix`
   - `git`
   - `gh`
@@ -27,7 +27,7 @@ This image is intentionally not a general workstation snapshot.
 
 The base layer should only cover:
 - shell access
-- repo transfer
+- file transfer
 - bootstrap scripts
 - common terminal tooling
 - smooth `nix develop` / project flake usage
@@ -149,9 +149,9 @@ fly ssh console --app <your-fly-app>
 - The volume mount is optional. If present, the entrypoint will reuse SSH host keys from `/persist/ssh`, but that also makes the box region-bound.
 - The login user is `rove`, with passwordless `sudo`, while the entrypoint stays root-owned so it can manage host keys and `sshd`.
 
-## Likely Rove target shape later
+## Rove Target Shape
 
-The default `devbox` target now assumes dotfiles are already in the image, so it stays lean:
+The default `devbox` target assumes the common terminal tooling is already in the image, so Rove only needs provider settings and optional bootstrap:
 
 ```json
 {

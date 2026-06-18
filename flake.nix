@@ -1,5 +1,5 @@
 {
-  description = "Rove: a personal execution CLI for on-demand remote compute";
+  description = "Rove: a personal CLI for provisioning disposable remote machines";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -80,7 +80,7 @@
 
           shellHook = ''
             echo "Rove dev shell"
-            echo "Available commands: zig build, zig build test, nix run . -- status"
+            echo "Available commands: zig build, zig build test, nix run . -- help"
           '';
         };
       });

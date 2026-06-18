@@ -354,7 +354,7 @@ pub fn printHelp(writer: anytype) !void {
         \\  rove down <name> [--json]
         \\
         \\Rove provisions and tracks disposable machines. Workspace sync,
-        \\tmux context movement, and distributed control belong above this layer.
+        \\terminal session state, and distributed control belong above this layer.
         \\
         \\Defaults:
         \\  config: ./rove.json
