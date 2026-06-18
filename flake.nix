@@ -68,10 +68,7 @@
             [
               zig
               git
-              gh
               openssh
-              rsync
-              tmux
               jq
               shellcheck
             ]
