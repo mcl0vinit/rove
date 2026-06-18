@@ -21,7 +21,7 @@ fakebin="${tmpdir}/bin"
 workdir="${tmpdir}/work"
 home="${tmpdir}/home"
 machines_json="${tmpdir}/machines.json"
-mkdir -p "${fakebin}" "${workdir}/.rove" "${home}/.config/gh"
+mkdir -p "${fakebin}" "${workdir}" "${home}"
 
 cat > "${machines_json}" <<'EOF'
 [
@@ -32,13 +32,6 @@ cat > "${machines_json}" <<'EOF'
     "region": "iad"
   }
 ]
-EOF
-
-cat > "${home}/.config/gh/hosts.yml" <<'EOF'
-github.com:
-    user: smoke
-    oauth_token: smoke-token
-    git_protocol: ssh
 EOF
 
 cat > "${fakebin}/flyctl" <<'EOF'
@@ -117,20 +110,7 @@ cat > "${fakebin}/scp" <<'EOF'
 exit 0
 EOF
 
-cat > "${fakebin}/rsync" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-for arg in "$@"; do
-  if [[ "${arg}" == "--dry-run" ]]; then
-    exit 0
-  fi
-done
-
-exit 0
-EOF
-
-chmod +x "${fakebin}/flyctl" "${fakebin}/ssh" "${fakebin}/scp" "${fakebin}/rsync"
+chmod +x "${fakebin}/flyctl" "${fakebin}/ssh" "${fakebin}/scp"
 
 cat > "${workdir}/rove.json" <<EOF
 {
@@ -138,20 +118,16 @@ cat > "${workdir}/rove.json" <<EOF
     {
       "name": "devbox",
       "provider": "fly",
-      "app": "fake-devbox",
-      "image": "registry.fly.io/fake-devbox:latest@sha256:smoke",
-      "vm_size": "shared-cpu-2x",
       "ssh_user": "rove",
-      "startup_script": "${repo_root}/scripts/bootstrap.sh"
+      "startup_script": "${repo_root}/scripts/bootstrap.sh",
+      "fly": {
+        "app": "fake-devbox",
+        "image": "registry.fly.io/fake-devbox:latest@sha256:smoke",
+        "vm_size": "shared-cpu-2x"
+      }
     }
   ]
 }
-EOF
-
-cat > "${workdir}/.rove/bootstrap.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-echo "workspace bootstrap"
 EOF
 
 run_rove() {
@@ -173,25 +149,38 @@ assert_contains() {
   fi
 }
 
-run_rove run devbox --name smoke >/dev/null
+assert_json() {
+  local json="$1"
+  local expr="$2"
+
+  if ! jq -e "${expr}" >/dev/null <<<"${json}"; then
+    echo "[error] expected JSON expression to pass: ${expr}" >&2
+    echo "[error] actual JSON:" >&2
+    printf '%s\n' "${json}" >&2
+    exit 1
+  fi
+}
+
+run_rove up devbox --name smoke >/dev/null
 refresh_output="$(run_rove refresh smoke)"
 assert_contains "${refresh_output}" $'smoke\tupdated\tready\tstarted'
 
-sync_output="$(run_rove sync smoke)"
-assert_contains "${sync_output}" "workspace synced"
+refresh_json="$(run_rove refresh smoke --json)"
+assert_json "${refresh_json}" '.results[0].name == "smoke" and .results[0].result == "updated" and .machines[0].name == "smoke"'
 
-workspaces_output="$(run_rove workspaces smoke)"
-assert_contains "${workspaces_output}" $'1\t*'
+list_output="$(run_rove list)"
+assert_contains "${list_output}" $'smoke\tdevbox\tfly\tready'
 
-pull_output="$(run_rove pull smoke --workspace 1 --preview)"
-assert_contains "${pull_output}" "no remote changes detected"
+list_json="$(run_rove list --json)"
+assert_json "${list_json}" '.machines[0].name == "smoke" and .machines[0].provider == "fly" and .machines[0].provider_scope == "fake-devbox" and .machines[0].status == "ready"'
 
-auth_output="$(run_rove auth smoke)"
-assert_contains "${auth_output}" "installed Git auth material"
-assert_contains "${auth_output}" "skipped local gh auth sync"
+status_output="$(run_rove status smoke)"
+assert_contains "${status_output}" $'smoke\tdevbox\tfly\tready'
 
-auth_copy_output="$(run_rove auth smoke --copy-gh)"
-assert_contains "${auth_copy_output}" "synced local gh auth config"
+inspect_json="$(run_rove inspect smoke --json)"
+assert_json "${inspect_json}" '.machine.name == "smoke" and .machine.target_name == "devbox" and .machine.status == "ready"'
+
+run_rove exec smoke -- true >/dev/null
 
 touch "${tmpdir}/hostkey-once"
 doctor_output="$(run_rove doctor smoke)"
@@ -203,7 +192,8 @@ mv "${machines_json}.tmp" "${machines_json}"
 prune_output="$(run_rove refresh adopted --prune-missing)"
 assert_contains "${prune_output}" $'adopted\tpruned\tprovisioned_unreachable\tmissing'
 
-run_rove down smoke >/dev/null
+down_json="$(run_rove down smoke --json)"
+assert_json "${down_json}" '.destroyed == true and .machine.name == "smoke"'
 
 state_json="${home}/.rove/state.json"
 if [[ ! -f "${state_json}" ]]; then

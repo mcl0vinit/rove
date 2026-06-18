@@ -1,47 +1,29 @@
 # Rove
 
-Rove is an opinionated remote development loop.
+Rove provisions and tracks disposable remote machines.
 
-It does more than boot a machine and hand you a shell. It brings up a pinned devbox, syncs a repo into it, restores tmux context, reconnects you to work that already feels in-progress, and gives you recovery commands when local state and cloud state drift apart.
+It is intentionally smaller than the original remote-development loop. Rove owns machine lifecycle, SSH reachability, bootstrap, provider reconciliation, and teardown. Workspace sync, tmux context movement, distributed search, and live control belong above this layer, especially in Mesh.
 
 The current V1 is narrow on purpose:
 - Fly Machines only
-- CPU devboxes only
-- one baked devbox image
+- CPU devboxes by default
+- pinned image refs
 - local JSON state in `~/.rove/state.json`
-- repo sync with `rsync`
-- tmux handoff with either plain layout restore or a custom capture hook
-- locked-down SSH with no agent or port forwarding
+- managed SSH keys and isolated known hosts
+- optional target bootstrap script
 
-## Why It Feels Different
-
-- the remote machine is a real devbox, not a blank cloud instance
-- the image is pinned, so bring-up is reproducible
-- your shell/tmux workflow is part of the product, not an afterthought
-- `offload` is about moving working context, not just copying files
-- `doctor`, `refresh`, and `adopt` exist because remote development gets messy in practice
-- the security model is opinionated: locked-down SSH, separate Git auth, and opt-in `gh` auth sync
-
-## The Loop
-
-This is the core workflow:
+## Core Workflow
 
 ```bash
-rove run devbox --name work
-rove auth work
-rove sync work
-rove offload work
-```
-
-Later:
-
-```bash
+rove up devbox --name work
+rove status work
+rove inspect work --json
 rove ssh work
-rove pull work
+rove exec work -- uname -a
 rove down work
 ```
 
-That is the point of Rove: bring a box up fast, move into it with context, reconnect cleanly, and tear it down without losing track of what happened.
+`rove run` remains an alias for `rove up`.
 
 ## Install
 
@@ -62,8 +44,8 @@ nix develop -c zig build test
 ## Core Concepts
 
 - `target`: a named machine definition in `rove.json`
-- `name`: a tracked machine instance name such as `work` or `sam-east`
-- `workspace`: a repo synced to that machine
+- `name`: a tracked machine instance name such as `work` or `gpu-east`
+- `provider`: the machine backend; currently only Fly is implemented
 
 ## Quick Start
 
@@ -71,28 +53,18 @@ nix develop -c zig build test
 2. Copy [`rove.example.json`](rove.example.json) to `rove.json`.
 3. Replace the example `app` and `image` values with your own Fly app and pinned image digest.
 4. Run `rove doctor` to verify local prerequisites.
-5. Start a machine, sync your repo, and offload your tmux session.
+5. Start a machine.
 
 Example:
 
 ```bash
 cp rove.example.json rove.json
 rove doctor
-rove run devbox --name work
-rove auth work
-rove sync work
-rove offload work
-```
-
-If you explicitly want local GitHub CLI auth copied to the remote box too:
-
-```bash
-rove auth work --copy-gh
+rove up devbox --name work
+rove ssh work
 ```
 
 ## Example Config
-
-Use [`rove.example.json`](rove.example.json) as a starting point:
 
 ```json
 {
@@ -100,96 +72,106 @@ Use [`rove.example.json`](rove.example.json) as a starting point:
     {
       "name": "devbox",
       "provider": "fly",
-      "app": "your-fly-app",
-      "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
-      "vm_size": "shared-cpu-2x",
       "ssh_user": "rove",
       "startup_script": "./scripts/bootstrap.sh",
-      "tmux": {
-        "backend": "shape"
+      "fly": {
+        "app": "your-fly-app",
+        "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
+        "vm_size": "shared-cpu-2x"
       }
     }
   ]
 }
 ```
 
+`startup_script` is optional. If present, Rove uploads and runs it after SSH becomes reachable. Provider settings live under a provider-named block such as `fly`; legacy top-level Fly fields are still accepted for old configs.
+
 The checked-in `rove.json` in this repo is a working repo-local config for development. Treat `rove.example.json` as the public template.
 
 ## Command Overview
 
 ```bash
-rove run <target> [--name <name>]
-rove status
-rove refresh [name] [--prune-missing]
+rove up <target> [--name <name>] [--json]
+rove run <target> [--name <name>] [--json]
+rove list [--json]
+rove status [name] [--json]
+rove inspect <name> [--json]
+rove refresh [name] [--prune-missing] [--json]
 rove doctor [name]
-rove auth <name> [--copy-gh]
-rove sync <name> [--preview] [--delete]
-rove workspaces <name>
-rove offload <name> [--workspace <selector>]
-rove ssh <name> [--workspace <selector>]
-rove pull <name> [--workspace <selector>] [--preview] [--force]
-rove adopt <target> <machine-id> [--name <name>]
-rove down <name>
+rove adopt <target> <machine-id> [--name <name>] [--json]
+rove ssh <name>
+rove exec <name> -- <command> [args...]
+rove down <name> [--json]
 ```
 
-Common workflow:
+## Script Contract
 
-```bash
-rove run devbox --name work
-rove auth work
-rove sync work
-rove offload work
+Rove's script-facing API is JSON on stdout and errors/warnings on stderr.
+
+Machine-list commands return:
+
+```json
+{
+  "machines": [
+    {
+      "name": "work",
+      "target_name": "devbox",
+      "provider": "fly",
+      "id": "machine-id",
+      "machine_name": "rove-work-abcd",
+      "provider_scope": "your-fly-app",
+      "app": "your-fly-app",
+      "host": "your-fly-app.fly.dev",
+      "region": "iad",
+      "remote_state": "started",
+      "ssh_user": "rove",
+      "status": "ready"
+    }
+  ]
+}
 ```
 
-Reconnect later:
+Single-machine commands return:
 
-```bash
-rove ssh work
+```json
+{
+  "machine": {
+    "name": "work",
+    "target_name": "devbox",
+    "provider": "fly",
+    "id": "machine-id",
+    "machine_name": "rove-work-abcd",
+    "provider_scope": "your-fly-app",
+    "app": "your-fly-app",
+    "host": "your-fly-app.fly.dev",
+    "region": "iad",
+    "remote_state": "started",
+    "ssh_user": "rove",
+    "status": "ready"
+  }
+}
 ```
 
-Preview or pull changes back:
-
-```bash
-rove pull work --preview
-rove pull work
-```
-
-Destroy the machine:
-
-```bash
-rove down work
-```
-
-Workspace selectors accepted by `pull`, `ssh`, and `offload`:
-- `active`
-- a workspace index from `rove workspaces <name>`
-- a workspace label
-- a full local path
-- a full remote path
+Prefer `rove inspect <name> --json` for scripts and future Mesh integration.
 
 ## Security Model
 
-Rove is designed for personal remote development, not as a hardened bastion host.
+Rove is designed for personal remote machine provisioning, not as a hardened bastion host.
 
 Current defaults:
 - SSH is key-only
-- root login is disabled
+- root login is disabled in the provided devbox image
 - SSH agent forwarding is disabled
 - TCP, stream-local, and tunnel forwarding are disabled
-- plain authorized keys are rewritten to `restrict,pty`
-- `rove auth` installs a separate Git SSH key, not your normal machine SSH key
-- GitHub CLI auth is opt-in and only copied with `--copy-gh`
+- plain authorized keys are rewritten to `restrict,pty` in the provided devbox image
+- SSH known-host entries are isolated under `~/.rove/known_hosts`
 
 Important limitation:
-- if someone gets shell access to the box, anything you intentionally copied there is exposed
-
-So the safe default is:
-- use `rove auth <name>` for SSH Git access
-- only use `rove auth <name> --copy-gh` if you explicitly want GitHub CLI auth on that box
+- if someone gets shell access to the box, anything you intentionally put there is exposed
 
 ## Recovery
 
-Refresh local state from Fly:
+Refresh local state from the provider:
 
 ```bash
 rove refresh
@@ -220,9 +202,21 @@ rove adopt devbox <machine-id> --name recovered
 - config loading
 - pinned image refs
 - managed SSH keys
-- optional local GitHub auth availability
 - tracked machine reachability
 - stale SSH host keys, with automatic cleanup and retry
+
+## Mesh Boundary
+
+Rove should stay the provider-backed machine launcher.
+
+Mesh should own:
+- tmux control
+- repo/port/pane indexing
+- distributed grep
+- live status across Tailscale nodes
+- routing and jump UX
+
+A future integration point should be narrow: Rove creates or adopts a machine, then Mesh discovers or registers it as a node.
 
 ## Building The Devbox Image
 
@@ -249,12 +243,3 @@ Run the fake-provider smoke test directly:
 nix develop -c zig build
 ./scripts/integration-smoke.sh
 ```
-
-## V1 Non-Goals
-
-- GPU providers
-- multiple providers
-- volume-backed roaming state
-- live process migration
-- editor buffer migration
-- multi-user orchestration

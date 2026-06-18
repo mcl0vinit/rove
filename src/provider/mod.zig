@@ -2,8 +2,13 @@ const std = @import("std");
 const model = @import("../model.zig");
 const fly = @import("fly.zig");
 
+pub const ProviderTargetConfig = union(model.ProviderKind) {
+    fly: model.FlyTargetConfig,
+};
+
 pub const CreateRequest = struct {
-    target: *const model.TargetConfig,
+    target_name: []const u8,
+    provider_config: ProviderTargetConfig,
     instance_name: []const u8,
     verbose: bool = false,
 };
@@ -23,13 +28,13 @@ pub const CreateResult = struct {
 };
 
 pub const DestroyRequest = struct {
-    app: []const u8,
+    provider_config: ProviderTargetConfig,
     machine_id: []const u8,
     verbose: bool = false,
 };
 
 pub const InspectRequest = struct {
-    app: []const u8,
+    provider_config: ProviderTargetConfig,
     machine_id: []const u8,
 };
 

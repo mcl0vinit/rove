@@ -1,18 +1,14 @@
 const std = @import("std");
-const auth = @import("auth.zig");
 const bootstrap = @import("bootstrap.zig");
 const config = @import("config.zig");
 const exec = @import("exec.zig");
 const keys = @import("keys.zig");
 const model = @import("model.zig");
 const paths = @import("paths.zig");
-const profile = @import("profile.zig");
 const provider = @import("provider/mod.zig");
-const sync = @import("sync.zig");
+const shell = @import("shell.zig");
 const ssh = @import("ssh.zig");
 const state = @import("state.zig");
-const tmux = @import("tmux.zig");
-const workspace = @import("workspace.zig");
 
 pub const ParseError = error{
     InvalidArguments,
@@ -22,20 +18,30 @@ pub const HandledFailure = error{
     HandledFailure,
 };
 
+const OutputFormat = enum {
+    human,
+    json,
+};
+
+pub const ListCommand = struct {
+    format: OutputFormat = .human,
+};
+
 pub const RunCommand = struct {
     target: []const u8,
     name: ?[]const u8 = null,
+    format: OutputFormat = .human,
 };
 
-pub const SyncCommand = struct {
-    machine_name: []const u8,
-    preview: bool = false,
-    delete: bool = false,
+pub const StatusCommand = struct {
+    machine_name: ?[]const u8 = null,
+    format: OutputFormat = .human,
 };
 
 pub const RefreshCommand = struct {
     machine_name: ?[]const u8 = null,
     prune_missing: bool = false,
+    format: OutputFormat = .human,
 };
 
 pub const DoctorCommand = struct {
@@ -46,39 +52,32 @@ pub const AdoptCommand = struct {
     target: []const u8,
     machine_id: []const u8,
     name: ?[]const u8 = null,
+    format: OutputFormat = .human,
 };
 
-pub const AuthCommand = struct {
+pub const ExecCommand = struct {
     machine_name: []const u8,
-    copy_gh: bool = false,
+    argv: []const []const u8,
 };
 
-pub const PullCommand = struct {
+pub const MachineCommand = struct {
     machine_name: []const u8,
-    preview: bool = false,
-    force: bool = false,
-    workspace_selector: ?[]const u8 = null,
-};
-
-pub const WorkspaceTargetCommand = struct {
-    machine_name: []const u8,
-    workspace_selector: ?[]const u8 = null,
+    format: OutputFormat = .human,
 };
 
 pub const Command = union(enum) {
     help,
-    status,
+    list: ListCommand,
+    status: StatusCommand,
+    inspect: MachineCommand,
     refresh: RefreshCommand,
     doctor: DoctorCommand,
     adopt: AdoptCommand,
-    auth: AuthCommand,
+    up: RunCommand,
     run: RunCommand,
-    sync: SyncCommand,
-    pull: PullCommand,
-    workspaces: []const u8,
-    offload: WorkspaceTargetCommand,
-    ssh: WorkspaceTargetCommand,
-    down: []const u8,
+    ssh: []const u8,
+    exec: ExecCommand,
+    down: MachineCommand,
 };
 
 pub fn run(
@@ -98,31 +97,41 @@ pub fn run(
 
     switch (command) {
         .help => try printHelp(stdout),
-        .status => try handleStatus(allocator, stdout, stderr),
+        .list => |list_command| try handleList(allocator, stdout, stderr, list_command),
+        .status => |status_command| try handleStatus(allocator, stdout, stderr, status_command),
+        .inspect => |machine_command| try handleInspect(allocator, stdout, stderr, machine_command),
         .refresh => |refresh_command| try handleRefresh(allocator, stdout, stderr, refresh_command),
         .doctor => |doctor_command| try handleDoctor(allocator, stdout, stderr, doctor_command),
         .adopt => |adopt_command| try handleAdopt(allocator, stdout, stderr, adopt_command),
-        .auth => |auth_command| try handleAuth(allocator, stdout, stderr, auth_command),
-        .run => |target| try handleRun(allocator, stdout, stderr, target),
-        .sync => |target| try handleSync(allocator, stdout, stderr, target),
-        .pull => |pull_command| try handlePull(allocator, stdout, stderr, pull_command),
-        .workspaces => |machine_name| try handleWorkspaces(allocator, stdout, stderr, machine_name),
-        .offload => |target| try handleOffload(allocator, stdout, stderr, target),
-        .ssh => |target| try handleSsh(allocator, stdout, stderr, target),
-        .down => |target| try handleDown(allocator, stdout, target),
+        .up => |run_command| try handleRun(allocator, stdout, stderr, run_command),
+        .run => |run_command| try handleRun(allocator, stdout, stderr, run_command),
+        .ssh => |machine_name| try handleSsh(allocator, stdout, stderr, machine_name),
+        .exec => |exec_command| try handleExec(allocator, stdout, stderr, exec_command),
+        .down => |machine_command| try handleDown(allocator, stdout, stderr, machine_command),
     }
 }
 
 pub fn parse(args: []const []const u8) ParseError!Command {
     if (args.len == 0) return .help;
 
-    if (std.mem.eql(u8, args[0], "status")) {
+    if (std.mem.eql(u8, args[0], "help") or
+        std.mem.eql(u8, args[0], "--help") or
+        std.mem.eql(u8, args[0], "-h"))
+    {
         if (args.len != 1) return error.InvalidArguments;
-        return .status;
+        return .help;
     }
 
-    if (std.mem.eql(u8, args[0], "run")) {
-        return .{ .run = try parseRunCommand(args) };
+    if (std.mem.eql(u8, args[0], "list") or std.mem.eql(u8, args[0], "ls")) {
+        return .{ .list = try parseListCommand(args) };
+    }
+
+    if (std.mem.eql(u8, args[0], "status")) {
+        return .{ .status = try parseStatusCommand(args) };
+    }
+
+    if (std.mem.eql(u8, args[0], "inspect")) {
+        return .{ .inspect = try parseMachineCommand(args) };
     }
 
     if (std.mem.eql(u8, args[0], "refresh")) {
@@ -130,71 +139,99 @@ pub fn parse(args: []const []const u8) ParseError!Command {
     }
 
     if (std.mem.eql(u8, args[0], "doctor")) {
-        return .{ .doctor = try parseDoctorCommand(args) };
+        if (args.len > 2) return error.InvalidArguments;
+        return .{ .doctor = .{ .machine_name = if (args.len == 2) try nonEmpty(args[1]) else null } };
     }
 
     if (std.mem.eql(u8, args[0], "adopt")) {
         return .{ .adopt = try parseAdoptCommand(args) };
     }
 
-    if (std.mem.eql(u8, args[0], "auth")) {
-        return .{ .auth = try parseAuthCommand(args) };
+    if (std.mem.eql(u8, args[0], "up")) {
+        return .{ .up = try parseRunCommand(args) };
     }
 
-    if (std.mem.eql(u8, args[0], "sync")) {
-        return .{ .sync = try parseSyncCommand(args) };
-    }
-
-    if (std.mem.eql(u8, args[0], "pull")) {
-        return .{ .pull = try parsePullCommand(args) };
-    }
-
-    if (std.mem.eql(u8, args[0], "workspaces")) {
-        return .{ .workspaces = try expectSingleTarget(args) };
+    if (std.mem.eql(u8, args[0], "run")) {
+        return .{ .run = try parseRunCommand(args) };
     }
 
     if (std.mem.eql(u8, args[0], "ssh")) {
-        return .{ .ssh = try parseWorkspaceTargetCommand(args) };
+        return .{ .ssh = try expectSingleTarget(args) };
     }
 
-    if (std.mem.eql(u8, args[0], "offload")) {
-        return .{ .offload = try parseWorkspaceTargetCommand(args) };
+    if (std.mem.eql(u8, args[0], "exec")) {
+        return .{ .exec = try parseExecCommand(args) };
     }
 
     if (std.mem.eql(u8, args[0], "down")) {
-        return .{ .down = try expectSingleTarget(args) };
-    }
-
-    if (std.mem.eql(u8, args[0], "help") or std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "-h")) {
-        if (args.len != 1) return error.InvalidArguments;
-        return .help;
+        return .{ .down = try parseMachineCommand(args) };
     }
 
     return error.InvalidArguments;
 }
 
+fn nonEmpty(value: []const u8) ParseError![]const u8 {
+    if (value.len == 0) return error.InvalidArguments;
+    return value;
+}
+
 fn expectSingleTarget(args: []const []const u8) ParseError![]const u8 {
     if (args.len != 2) return error.InvalidArguments;
-    if (args[1].len == 0) return error.InvalidArguments;
+    return nonEmpty(args[1]);
+}
 
-    return args[1];
+fn parseListCommand(args: []const []const u8) ParseError!ListCommand {
+    var command = ListCommand{};
+
+    var index: usize = 1;
+    while (index < args.len) {
+        if (try parseOutputFormatFlag(args[index], &command.format)) {
+            index += 1;
+            continue;
+        }
+
+        return error.InvalidArguments;
+    }
+
+    return command;
+}
+
+fn parseStatusCommand(args: []const []const u8) ParseError!StatusCommand {
+    var command = StatusCommand{};
+
+    var index: usize = 1;
+    while (index < args.len) {
+        if (try parseOutputFormatFlag(args[index], &command.format)) {
+            index += 1;
+            continue;
+        }
+
+        if (command.machine_name != null) return error.InvalidArguments;
+        command.machine_name = try nonEmpty(args[index]);
+        index += 1;
+    }
+
+    return command;
 }
 
 fn parseRunCommand(args: []const []const u8) ParseError!RunCommand {
     if (args.len < 2) return error.InvalidArguments;
-    if (args[1].len == 0) return error.InvalidArguments;
 
     var command = RunCommand{
-        .target = args[1],
+        .target = try nonEmpty(args[1]),
     };
 
     var index: usize = 2;
     while (index < args.len) {
+        if (try parseOutputFormatFlag(args[index], &command.format)) {
+            index += 1;
+            continue;
+        }
+
         if (std.mem.eql(u8, args[index], "--name")) {
             if (command.name != null) return error.InvalidArguments;
             if (index + 1 >= args.len) return error.InvalidArguments;
-            if (args[index + 1].len == 0) return error.InvalidArguments;
-            command.name = args[index + 1];
+            command.name = try nonEmpty(args[index + 1]);
             index += 2;
             continue;
         }
@@ -210,6 +247,11 @@ fn parseRefreshCommand(args: []const []const u8) ParseError!RefreshCommand {
 
     var index: usize = 1;
     while (index < args.len) {
+        if (try parseOutputFormatFlag(args[index], &command.format)) {
+            index += 1;
+            continue;
+        }
+
         if (std.mem.eql(u8, args[index], "--prune-missing")) {
             if (command.prune_missing) return error.InvalidArguments;
             command.prune_missing = true;
@@ -218,38 +260,32 @@ fn parseRefreshCommand(args: []const []const u8) ParseError!RefreshCommand {
         }
 
         if (command.machine_name != null) return error.InvalidArguments;
-        if (args[index].len == 0) return error.InvalidArguments;
-        command.machine_name = args[index];
+        command.machine_name = try nonEmpty(args[index]);
         index += 1;
     }
 
     return command;
 }
 
-fn parseDoctorCommand(args: []const []const u8) ParseError!DoctorCommand {
-    if (args.len > 2) return error.InvalidArguments;
-
-    return .{
-        .machine_name = if (args.len == 2) args[1] else null,
-    };
-}
-
 fn parseAdoptCommand(args: []const []const u8) ParseError!AdoptCommand {
     if (args.len < 3) return error.InvalidArguments;
-    if (args[1].len == 0 or args[2].len == 0) return error.InvalidArguments;
 
     var command = AdoptCommand{
-        .target = args[1],
-        .machine_id = args[2],
+        .target = try nonEmpty(args[1]),
+        .machine_id = try nonEmpty(args[2]),
     };
 
     var index: usize = 3;
     while (index < args.len) {
+        if (try parseOutputFormatFlag(args[index], &command.format)) {
+            index += 1;
+            continue;
+        }
+
         if (std.mem.eql(u8, args[index], "--name")) {
             if (command.name != null) return error.InvalidArguments;
             if (index + 1 >= args.len) return error.InvalidArguments;
-            if (args[index + 1].len == 0) return error.InvalidArguments;
-            command.name = args[index + 1];
+            command.name = try nonEmpty(args[index + 1]);
             index += 2;
             continue;
         }
@@ -260,19 +296,16 @@ fn parseAdoptCommand(args: []const []const u8) ParseError!AdoptCommand {
     return command;
 }
 
-fn parseAuthCommand(args: []const []const u8) ParseError!AuthCommand {
+fn parseMachineCommand(args: []const []const u8) ParseError!MachineCommand {
     if (args.len < 2) return error.InvalidArguments;
-    if (args[1].len == 0) return error.InvalidArguments;
 
-    var command = AuthCommand{
-        .machine_name = args[1],
+    var command = MachineCommand{
+        .machine_name = try nonEmpty(args[1]),
     };
 
     var index: usize = 2;
     while (index < args.len) {
-        if (std.mem.eql(u8, args[index], "--copy-gh")) {
-            if (command.copy_gh) return error.InvalidArguments;
-            command.copy_gh = true;
+        if (try parseOutputFormatFlag(args[index], &command.format)) {
             index += 1;
             continue;
         }
@@ -283,98 +316,24 @@ fn parseAuthCommand(args: []const []const u8) ParseError!AuthCommand {
     return command;
 }
 
-fn parsePullCommand(args: []const []const u8) ParseError!PullCommand {
-    if (args.len < 2) return error.InvalidArguments;
-    if (args[1].len == 0) return error.InvalidArguments;
+fn parseExecCommand(args: []const []const u8) ParseError!ExecCommand {
+    if (args.len < 4) return error.InvalidArguments;
+    if (!std.mem.eql(u8, args[2], "--")) return error.InvalidArguments;
 
-    var command = PullCommand{
-        .machine_name = args[1],
+    return .{
+        .machine_name = try nonEmpty(args[1]),
+        .argv = args[3..],
     };
-
-    var index: usize = 2;
-    while (index < args.len) {
-        if (std.mem.eql(u8, args[index], "--preview")) {
-            if (command.preview) return error.InvalidArguments;
-            command.preview = true;
-            index += 1;
-            continue;
-        }
-
-        if (std.mem.eql(u8, args[index], "--force")) {
-            if (command.force) return error.InvalidArguments;
-            command.force = true;
-            index += 1;
-            continue;
-        }
-
-        if (std.mem.eql(u8, args[index], "--workspace")) {
-            if (command.workspace_selector != null) return error.InvalidArguments;
-            if (index + 1 >= args.len) return error.InvalidArguments;
-            if (args[index + 1].len == 0) return error.InvalidArguments;
-            command.workspace_selector = args[index + 1];
-            index += 2;
-            continue;
-        }
-
-        return error.InvalidArguments;
-    }
-
-    return command;
 }
 
-fn parseSyncCommand(args: []const []const u8) ParseError!SyncCommand {
-    if (args.len < 2) return error.InvalidArguments;
-    if (args[1].len == 0) return error.InvalidArguments;
-
-    var command = SyncCommand{
-        .machine_name = args[1],
-    };
-
-    var index: usize = 2;
-    while (index < args.len) {
-        if (std.mem.eql(u8, args[index], "--preview")) {
-            if (command.preview) return error.InvalidArguments;
-            command.preview = true;
-            index += 1;
-            continue;
-        }
-
-        if (std.mem.eql(u8, args[index], "--delete")) {
-            if (command.delete) return error.InvalidArguments;
-            command.delete = true;
-            index += 1;
-            continue;
-        }
-
-        return error.InvalidArguments;
-    }
-
-    return command;
-}
-
-fn parseWorkspaceTargetCommand(args: []const []const u8) ParseError!WorkspaceTargetCommand {
-    if (args.len < 2) return error.InvalidArguments;
-    if (args[1].len == 0) return error.InvalidArguments;
-
-    var command = WorkspaceTargetCommand{
-        .machine_name = args[1],
-    };
-
-    var index: usize = 2;
-    while (index < args.len) {
-        if (std.mem.eql(u8, args[index], "--workspace")) {
-            if (command.workspace_selector != null) return error.InvalidArguments;
-            if (index + 1 >= args.len) return error.InvalidArguments;
-            if (args[index + 1].len == 0) return error.InvalidArguments;
-            command.workspace_selector = args[index + 1];
-            index += 2;
-            continue;
-        }
-
-        return error.InvalidArguments;
-    }
-
-    return command;
+fn parseOutputFormatFlag(
+    arg: []const u8,
+    format: *OutputFormat,
+) ParseError!bool {
+    if (!std.mem.eql(u8, arg, "--json")) return false;
+    if (format.* == .json) return error.InvalidArguments;
+    format.* = .json;
+    return true;
 }
 
 pub fn printHelp(writer: anytype) !void {
@@ -382,72 +341,157 @@ pub fn printHelp(writer: anytype) !void {
         \\rove
         \\
         \\Usage:
-        \\  rove refresh [name] [--prune-missing]
+        \\  rove up <target> [--name <name>] [--json]
+        \\  rove run <target> [--name <name>] [--json]
+        \\  rove list [--json]
+        \\  rove status [name] [--json]
+        \\  rove inspect <name> [--json]
+        \\  rove refresh [name] [--prune-missing] [--json]
         \\  rove doctor [name]
-        \\  rove adopt <target> <machine-id> [--name <name>]
-        \\  rove auth <name> [--copy-gh]
-        \\  rove run <target> [--name <name>]
-        \\  rove sync <name> [--preview] [--delete]
-        \\  rove pull <name> [--workspace <selector>] [--preview] [--force]
-        \\  rove workspaces <name>
-        \\  rove offload <name> [--workspace <selector>]
-        \\  rove status
-        \\  rove ssh <name> [--workspace <selector>]
-        \\  rove down <name>
+        \\  rove adopt <target> <machine-id> [--name <name>] [--json]
+        \\  rove ssh <name>
+        \\  rove exec <name> -- <command> [args...]
+        \\  rove down <name> [--json]
         \\
-        \\This scaffold matches the handoff's first milestone:
-        \\  1. run one target on one provider
-        \\  2. track it in local JSON state
-        \\  3. wait for SSH and run bootstrap
-        \\  4. sync a workspace and run repo-local bootstrap
-        \\  5. offload a workspace into tmux
-        \\  6. pull changes back
-        \\  7. inspect tracked workspaces
-        \\  8. SSH into it
-        \\  9. tear it down cleanly
+        \\Rove provisions and tracks disposable machines. Workspace sync,
+        \\tmux context movement, and distributed control belong above this layer.
         \\
         \\Defaults:
         \\  config: ./rove.json
         \\  state: ~/.rove/state.json
         \\
-        \\Naming:
-        \\  `run` takes a target from rove.json
-        \\  `--name` chooses the tracked instance name
-        \\  if omitted, the target name is used
-        \\  `refresh` updates local state from the provider for one machine or all machines
-        \\  `refresh --prune-missing` removes tracked machines that no longer exist remotely
-        \\  `doctor` checks local prerequisites, pinned images, auth material, and tracked machine health
-        \\  `adopt` imports an existing provider machine into local state
-        \\  `auth` installs Rove's SSH Git access material on the remote machine without relying on agent forwarding
-        \\  `auth --copy-gh` also copies local GitHub CLI auth to the remote machine
-        \\  `sync`, `pull`, `workspaces`, `offload`, `ssh`, and `down` address the tracked instance name
-        \\  `sync --preview` shows rsync changes to the remote workspace without writing files
-        \\  `sync --delete` removes remote files that no longer exist locally
-        \\  `pull --workspace`, `ssh --workspace`, and `offload --workspace` accept `active`, an index from `workspaces`, a label, a local path, or a remote path
-        \\  `pull --preview` shows rsync changes without writing local files
-        \\  `pull` refuses to overwrite a dirty local git repo unless `--force` is set
-        \\  `.roveignore` adds repo-local rsync exclusion rules for sync and offload
-        \\
     );
 }
 
-fn handleStatus(
+fn appendJsonString(
+    out: *std.Io.Writer.Allocating,
+    value: []const u8,
+) !void {
+    try std.json.Stringify.value(value, .{}, &out.writer);
+}
+
+fn appendJsonNullableString(
+    out: *std.Io.Writer.Allocating,
+    value: ?[]const u8,
+) !void {
+    if (value) |unwrapped| {
+        try appendJsonString(out, unwrapped);
+    } else {
+        try out.writer.writeAll("null");
+    }
+}
+
+fn appendMachineJson(
+    out: *std.Io.Writer.Allocating,
+    machine: model.MachineRecord,
+) !void {
+    try out.writer.writeAll("{\"name\":");
+    try appendJsonString(out, machine.name);
+    try out.writer.writeAll(",\"target_name\":");
+    try appendJsonNullableString(out, machine.target_name);
+    try out.writer.writeAll(",\"provider\":");
+    try appendJsonString(out, model.providerName(machine.provider));
+    try out.writer.writeAll(",\"id\":");
+    try appendJsonString(out, machine.id);
+    try out.writer.writeAll(",\"machine_name\":");
+    try appendJsonNullableString(out, machine.machine_name);
+    try out.writer.writeAll(",\"provider_scope\":");
+    try appendJsonNullableString(out, machine.provider_scope);
+    try out.writer.writeAll(",\"app\":");
+    try appendJsonNullableString(out, machine.app);
+    try out.writer.writeAll(",\"host\":");
+    try appendJsonString(out, machine.host);
+    try out.writer.writeAll(",\"region\":");
+    try appendJsonNullableString(out, machine.region);
+    try out.writer.writeAll(",\"remote_state\":");
+    try appendJsonNullableString(out, machine.remote_state);
+    try out.writer.writeAll(",\"ssh_user\":");
+    try appendJsonString(out, machine.ssh_user);
+    try out.writer.writeAll(",\"status\":");
+    try appendJsonString(out, model.statusName(machine.status));
+    try out.writer.writeByte('}');
+}
+
+fn writeMachineJsonDocument(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    machine: model.MachineRecord,
+) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try out.writer.writeAll("{\"machine\":");
+    try appendMachineJson(&out, machine);
+    try out.writer.writeAll("}\n");
+    try stdout.writeAll(out.written());
+}
+
+fn appendRefreshResultJson(
+    out: *std.Io.Writer.Allocating,
+    result: RefreshReport,
+) !void {
+    try out.writer.writeAll("{\"name\":");
+    try appendJsonString(out, result.refreshed.value.name);
+    try out.writer.writeAll(",\"result\":");
+    try appendJsonString(out, result.result);
+    try out.writer.writeAll(",\"pruned\":");
+    try out.writer.writeAll(if (result.pruned) "true" else "false");
+    try out.writer.writeAll(",\"machine\":");
+    try appendMachineJson(out, result.refreshed.value);
+    try out.writer.writeByte('}');
+}
+
+fn handleList(
     allocator: std.mem.Allocator,
     stdout: anytype,
     stderr: anytype,
+    command: ListCommand,
 ) !void {
     var loaded_state = try state.loadOrEmpty(allocator, null);
     defer loaded_state.deinit();
 
     if (loaded_state.value.machines.len == 0) {
+        if (command.format == .json) {
+            try stdout.writeAll("{\"machines\":[]}\n");
+            return;
+        }
+
         try stdout.writeAll(
             "[info] no tracked machines\n" ++
-                "[hint] new machines will be recorded in ~/.rove/state.json after `rove run <target>` succeeds\n",
+                "[hint] new machines will be recorded in ~/.rove/state.json after `rove up <target>` succeeds\n",
         );
         return;
     }
 
-    try stdout.writeAll("NAME\tTARGET\tPROVIDER\tSTATUS\tREMOTE\tHOST\tWORKSPACE\n");
+    if (command.format == .json) {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+
+        try out.writer.writeAll("{\"machines\":[");
+        for (loaded_state.value.machines, 0..) |machine, index| {
+            var refreshed = refreshMachineFromProvider(allocator, machine) catch |err| fallback: {
+                try std.fmt.format(
+                    stderr,
+                    "[warn] failed to refresh machine '{s}': {s}\n",
+                    .{ machine.name, @errorName(err) },
+                );
+
+                var fallback = RefreshedMachine{ .value = machine };
+                fallback.value.remote_state = "refresh_failed";
+                break :fallback fallback;
+            };
+            defer refreshed.deinit(allocator);
+
+            try state.upsertMachine(allocator, refreshed.value, null);
+            if (index > 0) try out.writer.writeByte(',');
+            try appendMachineJson(&out, refreshed.value);
+        }
+        try out.writer.writeAll("]}\n");
+        try stdout.writeAll(out.written());
+        return;
+    }
+
+    try stdout.writeAll("NAME\tTARGET\tPROVIDER\tSTATUS\tREMOTE\tHOST\tREGION\n");
     for (loaded_state.value.machines) |machine| {
         var refreshed = refreshMachineFromProvider(allocator, machine) catch |err| fallback: {
             try std.fmt.format(
@@ -456,65 +500,87 @@ fn handleStatus(
                 .{ machine.name, @errorName(err) },
             );
 
-            var fallback = RefreshedMachine{
-                .value = machine,
-            };
+            var fallback = RefreshedMachine{ .value = machine };
             fallback.value.remote_state = "refresh_failed";
             break :fallback fallback;
         };
         defer refreshed.deinit(allocator);
 
         try state.upsertMachine(allocator, refreshed.value, null);
-
-        const target_name = refreshed.value.target_name orelse refreshed.value.name;
-        const remote_state = refreshed.value.remote_state orelse "-";
-        if (workspace.activeTracked(refreshed.value)) |tracked_workspace| {
-            const tracked_count = workspace.trackedCount(refreshed.value);
-            if (tracked_count > 1) {
-                try std.fmt.format(
-                    stdout,
-                    "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s} (+{d})\n",
-                    .{
-                        refreshed.value.name,
-                        target_name,
-                        model.providerName(refreshed.value.provider),
-                        model.statusName(refreshed.value.status),
-                        remote_state,
-                        refreshed.value.host,
-                        tracked_workspace.remote_path,
-                        tracked_count - 1,
-                    },
-                );
-            } else {
-                try std.fmt.format(
-                    stdout,
-                    "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n",
-                    .{
-                        refreshed.value.name,
-                        target_name,
-                        model.providerName(refreshed.value.provider),
-                        model.statusName(refreshed.value.status),
-                        remote_state,
-                        refreshed.value.host,
-                        tracked_workspace.remote_path,
-                    },
-                );
-            }
-        } else {
-            try std.fmt.format(
-                stdout,
-                "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t-\n",
-                .{
-                    refreshed.value.name,
-                    target_name,
-                    model.providerName(refreshed.value.provider),
-                    model.statusName(refreshed.value.status),
-                    remote_state,
-                    refreshed.value.host,
-                },
-            );
-        }
+        try printMachineRow(stdout, refreshed.value);
     }
+}
+
+fn handleStatus(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    stderr: anytype,
+    command: StatusCommand,
+) !void {
+    if (command.machine_name == null) {
+        return handleList(allocator, stdout, stderr, .{ .format = command.format });
+    }
+
+    return handleInspect(allocator, stdout, stderr, .{
+        .machine_name = command.machine_name.?,
+        .format = command.format,
+    });
+}
+
+fn handleInspect(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    stderr: anytype,
+    command: MachineCommand,
+) !void {
+    var loaded_state = try state.loadOrEmpty(allocator, null);
+    defer loaded_state.deinit();
+
+    const machine = state.findMachine(&loaded_state.value, command.machine_name) orelse {
+        try std.fmt.format(
+            stderr,
+            "[error] no tracked machine named '{s}'\n" ++
+                "[hint] use `rove list` to inspect tracked machines\n",
+            .{command.machine_name},
+        );
+        return error.HandledFailure;
+    };
+
+    var refreshed = refreshMachineFromProvider(allocator, machine.*) catch |err| {
+        try std.fmt.format(
+            stderr,
+            "[error] failed to refresh machine '{s}': {s}\n",
+            .{ command.machine_name, @errorName(err) },
+        );
+        return error.HandledFailure;
+    };
+    defer refreshed.deinit(allocator);
+
+    try state.upsertMachine(allocator, refreshed.value, null);
+
+    if (command.format == .json) {
+        try writeMachineJsonDocument(allocator, stdout, refreshed.value);
+        return;
+    }
+
+    try stdout.writeAll("NAME\tTARGET\tPROVIDER\tSTATUS\tREMOTE\tHOST\tREGION\n");
+    try printMachineRow(stdout, refreshed.value);
+}
+
+fn printMachineRow(stdout: anytype, machine: model.MachineRecord) !void {
+    try std.fmt.format(
+        stdout,
+        "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n",
+        .{
+            machine.name,
+            machine.target_name orelse machine.name,
+            model.providerName(machine.provider),
+            model.statusName(machine.status),
+            machine.remote_state orelse "-",
+            machine.host,
+            machine.region orelse "-",
+        },
+    );
 }
 
 fn handleRefresh(
@@ -527,10 +593,69 @@ fn handleRefresh(
     defer loaded_state.deinit();
 
     if (loaded_state.value.machines.len == 0) {
+        if (command.format == .json) {
+            try stdout.writeAll("{\"results\":[],\"machines\":[]}\n");
+            return;
+        }
+
         try stdout.writeAll(
             "[info] no tracked machines\n" ++
-                "[hint] use `rove run <target>` or `rove adopt <target> <machine-id>` first\n",
+                "[hint] use `rove up <target>` or `rove adopt <target> <machine-id>` first\n",
         );
+        return;
+    }
+
+    if (command.format == .json) {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+
+        try out.writer.writeAll("{\"results\":[");
+        var emitted: usize = 0;
+
+        if (command.machine_name) |machine_name| {
+            const machine = state.findMachine(&loaded_state.value, machine_name) orelse {
+                try std.fmt.format(
+                    stderr,
+                    "[error] no tracked machine named '{s}'\n" ++
+                        "[hint] use `rove list` to inspect tracked machines\n",
+                    .{machine_name},
+                );
+                return error.HandledFailure;
+            };
+
+            var report = refreshMachineForReport(allocator, stderr, machine.*, command.prune_missing) catch |err| switch (err) {
+                error.HandledFailure => return error.HandledFailure,
+                else => return err,
+            };
+            defer report.deinit(allocator);
+
+            try appendRefreshResultJson(&out, report);
+            emitted += 1;
+        } else {
+            for (loaded_state.value.machines) |machine| {
+                var report = refreshMachineForReport(allocator, stderr, machine, command.prune_missing) catch |err| switch (err) {
+                    error.HandledFailure => continue,
+                    else => return err,
+                };
+                defer report.deinit(allocator);
+
+                if (emitted > 0) try out.writer.writeByte(',');
+                try appendRefreshResultJson(&out, report);
+                emitted += 1;
+            }
+        }
+
+        try out.writer.writeAll("],\"machines\":[");
+        var reloaded = try state.loadOrEmpty(allocator, null);
+        defer reloaded.deinit();
+
+        for (reloaded.value.machines, 0..) |machine, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try appendMachineJson(&out, machine);
+        }
+
+        try out.writer.writeAll("]}\n");
+        try stdout.writeAll(out.written());
         return;
     }
 
@@ -541,7 +666,7 @@ fn handleRefresh(
             try std.fmt.format(
                 stderr,
                 "[error] no tracked machine named '{s}'\n" ++
-                    "[hint] use `rove status` to inspect tracked machines\n",
+                    "[hint] use `rove list` to inspect tracked machines\n",
                 .{machine_name},
             );
             return error.HandledFailure;
@@ -573,7 +698,6 @@ fn handleDoctor(
     try stdout.writeAll("CHECK\tSTATUS\tDETAILS\n");
 
     var has_errors = false;
-
     doctorExecCheck(allocator, stdout, "flyctl", &.{ "flyctl", "version" }, "flyctl is available", &has_errors);
     doctorExecCheck(allocator, stdout, "fly auth", &.{ "flyctl", "auth", "whoami" }, "Fly auth is configured", &has_errors);
 
@@ -589,18 +713,16 @@ fn handleDoctor(
 
     try printDoctorRow(stdout, "config", "ok", "loaded rove.json");
     for (loaded_config.value.targets) |target| {
+        const image_ref = switch (target.provider) {
+            .fly => config.resolveFlyTarget(target).image,
+        };
         const detail = try std.fmt.allocPrint(allocator, "{s}: {s}", .{
             target.name,
-            if (isPinnedImageRef(target.image)) "pinned image ref" else "unpinned image ref",
+            if (isPinnedImageRef(image_ref)) "pinned image ref" else "unpinned image ref",
         });
         defer allocator.free(detail);
 
-        try printDoctorRow(
-            stdout,
-            "image",
-            if (isPinnedImageRef(target.image)) "ok" else "warn",
-            detail,
-        );
+        try printDoctorRow(stdout, "image", if (isPinnedImageRef(image_ref)) "ok" else "warn", detail);
     }
 
     const managed_key = keys.ensureManagedKeyPair(allocator) catch |err| {
@@ -610,25 +732,6 @@ fn handleDoctor(
     };
     defer managed_key.deinit(allocator);
     try printDoctorRow(stdout, "machine ssh key", "ok", "managed machine SSH key is present");
-
-    const git_auth_key = keys.ensureGitAuthKeyPair(allocator) catch |err| {
-        has_errors = true;
-        try printDoctorRow(stdout, "git auth key", "error", @errorName(err));
-        return error.HandledFailure;
-    };
-    defer git_auth_key.deinit(allocator);
-    try printDoctorRow(stdout, "git auth key", "ok", "dedicated Git auth SSH key is present");
-
-    const local_gh_auth = try auth.localGhAuthAvailable(allocator);
-    try printDoctorRow(
-        stdout,
-        "gh auth",
-        "ok",
-        if (local_gh_auth)
-            "local GitHub CLI auth is available for optional `rove auth <name> --copy-gh`"
-        else
-            "local gh auth not found; remote gh auth sync is disabled unless explicitly requested",
-    );
 
     var loaded_state = try state.loadOrEmpty(allocator, null);
     defer loaded_state.deinit();
@@ -652,63 +755,6 @@ fn handleDoctor(
         try stderr.writeAll("[warn] doctor found one or more errors\n");
         return error.HandledFailure;
     }
-}
-
-fn handleAuth(
-    allocator: std.mem.Allocator,
-    stdout: anytype,
-    stderr: anytype,
-    command: AuthCommand,
-) !void {
-    var loaded_state = try state.loadOrEmpty(allocator, null);
-    defer loaded_state.deinit();
-
-    const machine = state.findMachine(&loaded_state.value, command.machine_name) orelse {
-        try std.fmt.format(
-            stderr,
-            "[error] no tracked machine named '{s}'\n" ++
-                "[hint] run or adopt a machine before syncing auth\n",
-            .{command.machine_name},
-        );
-        return error.HandledFailure;
-    };
-
-    const result = auth.syncGitHubAccess(allocator, machine.*, .{
-        .copy_gh_auth = command.copy_gh,
-    }) catch |err| {
-        try std.fmt.format(
-            stderr,
-            "[error] failed to sync remote auth for machine '{s}': {s}\n",
-            .{ command.machine_name, @errorName(err) },
-        );
-        return error.HandledFailure;
-    };
-    defer result.deinit(allocator);
-
-    try std.fmt.format(
-        stdout,
-        "[info] installed Git auth material on machine '{s}'\n" ++
-            "[info] local private repos over SSH will use ~/.ssh/rove_git_ed25519 on the remote box\n",
-        .{command.machine_name},
-    );
-
-    if (command.copy_gh and result.gh_config_synced) {
-        try stdout.writeAll("[info] synced local gh auth config to the remote machine\n");
-    } else if (command.copy_gh) {
-        try stdout.writeAll("[warn] local gh auth config was not found; only SSH Git auth was installed\n");
-    } else {
-        try stdout.writeAll("[info] skipped local gh auth sync; pass `--copy-gh` to copy GitHub CLI auth intentionally\n");
-    }
-
-    if (result.git_identity_synced) {
-        try stdout.writeAll("[info] synced local global git identity to the remote machine\n");
-    }
-
-    try std.fmt.format(
-        stdout,
-        "[hint] add this public key to GitHub once if private SSH remotes fail:\n{s}\n",
-        .{result.public_key},
-    );
 }
 
 fn handleAdopt(
@@ -751,14 +797,15 @@ fn handleAdopt(
         try std.fmt.format(
             stderr,
             "[error] machine '{s}' is already tracked as '{s}'\n" ++
-                "[hint] use `rove refresh {s}` or `rove status` to inspect it\n",
-            .{ command.machine_id, existing.name, existing.name },
+                "[hint] use `rove refresh {s}` or `rove status {s}` to inspect it\n",
+            .{ command.machine_id, existing.name, existing.name, existing.name },
         );
         return error.HandledFailure;
     }
 
+    const target_provider_config = providerConfigForTarget(target.*);
     const inspected = try provider.inspect(allocator, target.provider, .{
-        .app = target.app,
+        .provider_config = target_provider_config,
         .machine_id = command.machine_id,
     });
     defer inspected.deinit(allocator);
@@ -766,8 +813,8 @@ fn handleAdopt(
     if (!inspected.exists) {
         try std.fmt.format(
             stderr,
-            "[error] machine '{s}' was not found in app '{s}'\n",
-            .{ command.machine_id, target.app },
+            "[error] machine '{s}' was not found for target '{s}'\n",
+            .{ command.machine_id, target.name },
         );
         return error.HandledFailure;
     }
@@ -793,7 +840,8 @@ fn handleAdopt(
         return error.HandledFailure;
     }
 
-    const fallback_host = try std.fmt.allocPrint(allocator, "{s}.fly.dev", .{target.app});
+    const fly_config = target_provider_config.fly;
+    const fallback_host = try std.fmt.allocPrint(allocator, "{s}.fly.dev", .{fly_config.app});
     defer allocator.free(fallback_host);
 
     const machine = model.MachineRecord{
@@ -802,7 +850,8 @@ fn handleAdopt(
         .provider = target.provider,
         .id = command.machine_id,
         .machine_name = inspected.machine_name,
-        .app = target.app,
+        .provider_scope = fly_config.app,
+        .app = fly_config.app,
         .host = inspected.host orelse fallback_host,
         .region = inspected.region,
         .remote_state = inspected.remote_state,
@@ -811,6 +860,11 @@ fn handleAdopt(
     };
 
     try state.upsertMachine(allocator, machine, null);
+
+    if (command.format == .json) {
+        try writeMachineJsonDocument(allocator, stdout, machine);
+        return;
+    }
 
     try std.fmt.format(
         stdout,
@@ -825,7 +879,7 @@ fn handleAdopt(
             adopted_name,
             target.name,
             model.providerName(target.provider),
-            target.app,
+            fly_config.app,
             machine.host,
             machine.remote_state orelse "unknown",
         },
@@ -856,8 +910,8 @@ fn handleRun(
         try std.fmt.format(
             stderr,
             "[error] instance '{s}' already has a tracked machine\n" ++
-                "[hint] use `rove status` to inspect it or `rove down {s}` before creating another\n",
-            .{ instance_name, instance_name },
+                "[hint] use `rove status {s}` to inspect it or `rove down {s}` before creating another\n",
+            .{ instance_name, instance_name, instance_name },
         );
         return error.HandledFailure;
     }
@@ -889,11 +943,14 @@ fn handleRun(
         else => return err,
     };
 
+    const target_provider_config = providerConfigForTarget(target.*);
+    const fly_config = target_provider_config.fly;
     const placement = try renderPlacementSummary(allocator, target.*);
     defer allocator.free(placement);
 
     const created = provider.create(allocator, target.provider, .{
-        .target = target,
+        .target_name = target.name,
+        .provider_config = target_provider_config,
         .instance_name = instance_name,
     }) catch |err| {
         try std.fmt.format(
@@ -911,7 +968,8 @@ fn handleRun(
         .provider = target.provider,
         .id = created.machine_id,
         .machine_name = created.machine_name,
-        .app = target.app,
+        .provider_scope = fly_config.app,
+        .app = fly_config.app,
         .host = created.host,
         .region = created.region,
         .ssh_user = target.ssh_user,
@@ -920,41 +978,41 @@ fn handleRun(
 
     try state.upsertMachine(allocator, machine, null);
 
-    try std.fmt.format(
-        stdout,
-        "[info] instance '{s}' created from target '{s}'\n" ++
-            "[info] target: {s}\n" ++
-            "[info] name: {s}\n" ++
-            "[info] provider: {s}\n" ++
-            "[info] app: {s}\n" ++
-            "[info] machine_id: {s}\n" ++
-            "[info] image: {s}\n" ++
-            "[info] vm_size: {s}\n" ++
-            "[info] placement: {s}\n" ++
-            "[info] host: {s}\n",
-        .{
-            machine.name,
-            target.name,
-            target.name,
-            machine.name,
-            model.providerName(target.provider),
-            target.app,
-            created.machine_id,
-            target.image,
-            target.vm_size,
-            placement,
-            created.host,
-        },
-    );
+    if (command.format == .human) {
+        try std.fmt.format(
+            stdout,
+            "[info] instance '{s}' created from target '{s}'\n" ++
+                "[info] provider: {s}\n" ++
+                "[info] app: {s}\n" ++
+                "[info] machine_id: {s}\n" ++
+                "[info] image: {s}\n" ++
+                "[info] vm_size: {s}\n" ++
+                "[info] placement: {s}\n" ++
+                "[info] host: {s}\n",
+            .{
+                machine.name,
+                target.name,
+                model.providerName(target.provider),
+                fly_config.app,
+                created.machine_id,
+                fly_config.image,
+                fly_config.vm_size,
+                placement,
+                created.host,
+            },
+        );
+    }
 
     machine.status = .waiting_for_ssh;
     try state.upsertMachine(allocator, machine, null);
 
-    try std.fmt.format(
-        stdout,
-        "[info] waiting for SSH on {s}@{s}\n",
-        .{ machine.ssh_user, machine.host },
-    );
+    if (command.format == .human) {
+        try std.fmt.format(
+            stdout,
+            "[info] waiting for SSH on {s}@{s}\n",
+            .{ machine.ssh_user, machine.host },
+        );
+    }
 
     ssh.waitForReady(allocator, machine, .{}) catch |err| {
         machine.status = .provisioned_unreachable;
@@ -963,75 +1021,48 @@ fn handleRun(
         try std.fmt.format(
             stderr,
             "[error] ssh did not become ready for instance '{s}': {s}\n" ++
-                "[hint] inspect the machine with `rove status` or `rove ssh {s}` once access works\n",
-            .{ machine.name, @errorName(err), machine.name },
+                "[hint] inspect the machine with `rove status {s}` or `rove ssh {s}` once access works\n",
+            .{ machine.name, @errorName(err), machine.name, machine.name },
         );
         return error.HandledFailure;
     };
 
-    machine.status = .bootstrapping;
-    try state.upsertMachine(allocator, machine, null);
-
-    try std.fmt.format(
-        stdout,
-        "[info] SSH ready\n" ++
-            "[info] running bootstrap script: {s}\n",
-        .{target.startup_script},
-    );
-
-    bootstrap.run(allocator, machine, target.startup_script) catch |err| {
-        machine.status = .bootstrap_failed;
+    if (target.startup_script) |startup_script| {
+        machine.status = .bootstrapping;
         try state.upsertMachine(allocator, machine, null);
 
-        try std.fmt.format(
-            stderr,
-            "[error] bootstrap failed for instance '{s}': {s}\n" ++
-                "[hint] the machine is still running; use `rove ssh {s}` to inspect it\n",
-            .{ machine.name, @errorName(err), machine.name },
-        );
-        return error.HandledFailure;
-    };
+        if (command.format == .human) {
+            try std.fmt.format(
+                stdout,
+                "[info] SSH ready\n" ++
+                    "[info] running bootstrap script: {s}\n",
+                .{startup_script},
+            );
+        }
 
-    if (target.profile) |target_profile| {
-        machine.status = .applying_profile;
-        try state.upsertMachine(allocator, machine, null);
-
-        try std.fmt.format(
-            stdout,
-            "[info] applying profile: {s}\n",
-            .{target_profile.repo},
-        );
-
-        profile.apply(allocator, machine, target_profile) catch |err| {
-            machine.status = .profile_failed;
+        bootstrap.run(allocator, machine, startup_script) catch |err| {
+            machine.status = .bootstrap_failed;
             try state.upsertMachine(allocator, machine, null);
 
             try std.fmt.format(
                 stderr,
-                "[error] profile apply failed for instance '{s}': {s}\n" ++
+                "[error] bootstrap failed for instance '{s}': {s}\n" ++
                     "[hint] the machine is still running; use `rove ssh {s}` to inspect it\n",
                 .{ machine.name, @errorName(err), machine.name },
             );
             return error.HandledFailure;
         };
-
-        // Re-run the base bootstrap after profile install so Rove-managed shell setup survives dotfiles changes.
-        bootstrap.run(allocator, machine, target.startup_script) catch |err| {
-            machine.status = .profile_failed;
-            try state.upsertMachine(allocator, machine, null);
-
-            try std.fmt.format(
-                stderr,
-                "[error] failed to reconcile bootstrap after profile apply for instance '{s}': {s}\n" ++
-                    "[hint] the machine is still running; use `rove ssh {s}` to inspect it\n",
-                .{ machine.name, @errorName(err), machine.name },
-            );
-            return error.HandledFailure;
-        };
+    } else if (command.format == .human) {
+        try stdout.writeAll("[info] SSH ready\n");
     }
 
     machine.status = .ready;
     try state.upsertMachine(allocator, machine, null);
+
+    if (command.format == .json) {
+        try writeMachineJsonDocument(allocator, stdout, machine);
+        return;
+    }
 
     try std.fmt.format(
         stdout,
@@ -1045,67 +1076,41 @@ fn handleSsh(
     allocator: std.mem.Allocator,
     stdout: anytype,
     stderr: anytype,
-    command: WorkspaceTargetCommand,
+    machine_name: []const u8,
 ) !void {
+    _ = stdout;
+
     var loaded_state = try state.loadOrEmpty(allocator, null);
     defer loaded_state.deinit();
 
-    const machine = state.findMachine(&loaded_state.value, command.machine_name) orelse {
+    const machine = state.findMachine(&loaded_state.value, machine_name) orelse {
         try std.fmt.format(
-            stdout,
+            stderr,
             "[error] no tracked machine named '{s}'\n" ++
                 "[hint] run a target first so SSH knows where to connect\n",
-            .{command.machine_name},
+            .{machine_name},
         );
         return error.HandledFailure;
     };
 
     if (machine.status == .destroying) {
-        try std.fmt.format(
-            stderr,
-            "[error] machine '{s}' is being destroyed\n",
-            .{command.machine_name},
-        );
+        try std.fmt.format(stderr, "[error] machine '{s}' is being destroyed\n", .{machine_name});
         return error.HandledFailure;
     }
 
-    const term = term: {
-        if (command.workspace_selector) |selector| {
-            break :term try openWorkspaceSsh(allocator, stderr, machine.*, command.machine_name, selector);
-        }
-
-        if (workspace.activeTracked(machine.*)) |tracked| {
-            break :term openTrackedWorkspaceSsh(
-                allocator,
-                stderr,
-                machine.*,
-                command.machine_name,
-                tracked,
-                workspace.recordName(tracked),
-            ) catch |err| switch (err) {
-                error.HandledFailure => {
-                    try std.fmt.format(
-                        stderr,
-                        "[warn] failed to attach the active workspace for '{s}'; falling back to a raw shell\n",
-                        .{command.machine_name},
-                    );
-                    break :term try openRawSsh(allocator, stderr, machine.*, command.machine_name);
-                },
-                else => return err,
-            };
-        }
-
-        break :term try openRawSsh(allocator, stderr, machine.*, command.machine_name);
+    const term = ssh.openInteractive(allocator, machine.*) catch |err| {
+        try std.fmt.format(
+            stderr,
+            "[error] failed to start ssh for machine '{s}': {s}\n",
+            .{ machine_name, @errorName(err) },
+        );
+        return error.HandledFailure;
     };
 
     switch (term) {
         .Exited => |code| {
             if (code != 0) {
-                try std.fmt.format(
-                    stderr,
-                    "[error] ssh exited with code {d}\n",
-                    .{code},
-                );
+                try std.fmt.format(stderr, "[error] ssh exited with code {d}\n", .{code});
                 return error.HandledFailure;
             }
         },
@@ -1116,416 +1121,70 @@ fn handleSsh(
     }
 }
 
-fn handleWorkspaces(
+fn handleExec(
     allocator: std.mem.Allocator,
     stdout: anytype,
     stderr: anytype,
-    machine_name: []const u8,
+    command: ExecCommand,
 ) !void {
     var loaded_state = try state.loadOrEmpty(allocator, null);
     defer loaded_state.deinit();
 
-    const machine = state.findMachine(&loaded_state.value, machine_name) orelse {
+    const machine = state.findMachine(&loaded_state.value, command.machine_name) orelse {
         try std.fmt.format(
             stderr,
             "[error] no tracked machine named '{s}'\n" ++
-                "[hint] run a target first so there is a machine to inspect\n",
-            .{machine_name},
-        );
-        return error.HandledFailure;
-    };
-
-    if (workspace.trackedCount(machine.*) == 0) {
-        try std.fmt.format(
-            stdout,
-            "[info] machine '{s}' has no tracked workspaces yet\n" ++
-                "[hint] run `rove sync {s}` or `rove offload {s}` first\n",
-            .{ machine_name, machine_name, machine_name },
-        );
-        return;
-    }
-
-    const active = workspace.activeTracked(machine.*);
-    try stdout.writeAll("INDEX\tACTIVE\tNAME\tLOCAL\tREMOTE\tTMUX\n");
-
-    if (machine.workspaces.len > 0) {
-        for (machine.workspaces, 0..) |tracked, index| {
-            try printWorkspaceRow(stdout, index + 1, tracked, active);
-        }
-    } else if (machine.workspace) |tracked| {
-        try printWorkspaceRow(stdout, 1, tracked, active);
-    }
-
-    try std.fmt.format(
-        stdout,
-        "[hint] use `--workspace active`, `--workspace <index>`, a label, a local path, or a remote path with `rove pull {s}`, `rove ssh {s}`, or `rove offload {s}`\n",
-        .{ machine_name, machine_name, machine_name },
-    );
-}
-
-fn printWorkspaceRow(
-    stdout: anytype,
-    index: usize,
-    tracked: model.WorkspaceRecord,
-    active: ?model.WorkspaceRecord,
-) !void {
-    const is_active = if (active) |record|
-        std.mem.eql(u8, record.local_path, tracked.local_path)
-    else
-        false;
-    const tmux_session = tracked.tmux_session orelse "-";
-
-    try std.fmt.format(
-        stdout,
-        "{d}\t{s}\t{s}\t{s}\t{s}\t{s}\n",
-        .{
-            index,
-            if (is_active) "*" else "-",
-            workspace.recordName(tracked),
-            tracked.local_path,
-            tracked.remote_path,
-            tmux_session,
-        },
-    );
-}
-
-fn handleSync(
-    allocator: std.mem.Allocator,
-    stdout: anytype,
-    stderr: anytype,
-    command: SyncCommand,
-) !void {
-    var loaded_state = try state.loadOrEmpty(allocator, null);
-    defer loaded_state.deinit();
-
-    const machine_ptr = state.findMachine(&loaded_state.value, command.machine_name) orelse {
-        try std.fmt.format(
-            stderr,
-            "[error] no tracked machine named '{s}'\n" ++
-                "[hint] run a target first so there is a machine to sync into\n",
+                "[hint] run a target first so there is a machine to execute on\n",
             .{command.machine_name},
         );
         return error.HandledFailure;
     };
 
-    if (machine_ptr.status == .destroying) {
-        try std.fmt.format(
-            stderr,
-            "[error] machine '{s}' is being destroyed\n",
-            .{command.machine_name},
-        );
+    if (machine.status == .destroying) {
+        try std.fmt.format(stderr, "[error] machine '{s}' is being destroyed\n", .{command.machine_name});
         return error.HandledFailure;
     }
 
-    var machine = machine_ptr.*;
-    const resolved = try workspace.discover(allocator, machine);
-    defer resolved.deinit(allocator);
+    const remote_command = try renderRemoteCommand(allocator, command.argv);
+    defer allocator.free(remote_command);
 
-    if (command.preview) {
-        var preview = sync.previewSyncWorkspace(allocator, machine, resolved, .{
-            .delete = command.delete,
-        }) catch |err| {
-            try std.fmt.format(
-                stderr,
-                "[error] workspace sync preview failed for machine '{s}': {s}\n",
-                .{ command.machine_name, @errorName(err) },
-            );
-            return error.HandledFailure;
-        };
-        defer preview.deinit(allocator);
-
-        try std.fmt.format(
-            stdout,
-            "[info] previewing sync from '{s}' to {s}\n",
-            .{ resolved.local_root, resolved.remote_root },
-        );
-        if (command.delete) {
-            try stdout.writeAll("[info] preview includes remote deletions because --delete was set\n");
-        }
-
-        if (preview.hasChanges()) {
-            try stdout.writeAll(preview.changes);
-        } else {
-            try stdout.writeAll("[info] no local changes detected\n");
-        }
-        return;
-    }
-
-    try std.fmt.format(
-        stdout,
-        "[info] syncing workspace '{s}' to {s}\n",
-        .{ resolved.local_root, resolved.remote_root },
-    );
-    if (command.delete) {
-        try stdout.writeAll("[info] deleting remote files missing from the local workspace because --delete was set\n");
-    }
-
-    const ran_bootstrap_hook = try syncResolvedWorkspace(
-        allocator,
-        stderr,
-        &machine,
-        command.machine_name,
-        resolved,
-        .syncing,
-        .sync_failed,
-        .{
-            .delete = command.delete,
-        },
-    );
-
-    const tracked_workspaces = try workspace.mergeTracked(allocator, machine, workspace.buildRecord(resolved, null));
-    defer tracked_workspaces.deinit(allocator);
-
-    machine.workspace = tracked_workspaces.active;
-    machine.workspaces = tracked_workspaces.records;
-    machine.status = .ready;
-    try state.upsertMachine(allocator, machine, null);
-
-    try std.fmt.format(
-        stdout,
-        "[info] workspace synced for machine '{s}'\n",
-        .{command.machine_name},
-    );
-    if (ran_bootstrap_hook) {
-        try stdout.writeAll("[info] ran repo-local bootstrap hook .rove/bootstrap.sh\n");
-    }
-}
-
-fn handlePull(
-    allocator: std.mem.Allocator,
-    stdout: anytype,
-    stderr: anytype,
-    command: PullCommand,
-) !void {
-    var loaded_state = try state.loadOrEmpty(allocator, null);
-    defer loaded_state.deinit();
-
-    const machine_ptr = state.findMachine(&loaded_state.value, command.machine_name) orelse {
+    const result = ssh.runBatchCommand(allocator, machine.*, remote_command) catch |err| {
         try std.fmt.format(
             stderr,
-            "[error] no tracked machine named '{s}'\n" ++
-                "[hint] run a target first so there is a machine to pull from\n",
-            .{command.machine_name},
-        );
-        return error.HandledFailure;
-    };
-
-    if (machine_ptr.status == .destroying) {
-        try std.fmt.format(
-            stderr,
-            "[error] machine '{s}' is being destroyed\n",
-            .{command.machine_name},
-        );
-        return error.HandledFailure;
-    }
-
-    var machine = machine_ptr.*;
-    const resolved = workspace.resolvePull(allocator, machine, command.workspace_selector) catch |err| switch (err) {
-        error.WorkspaceNotFound => {
-            try std.fmt.format(
-                stderr,
-                "[error] machine '{s}' has no tracked workspace matching '{s}'\n" ++
-                    "[hint] use `active`, an index, a label, a local path, or a remote path from `rove workspaces {s}`\n",
-                .{ command.machine_name, command.workspace_selector.?, command.machine_name },
-            );
-            return error.HandledFailure;
-        },
-        error.AmbiguousWorkspaceSelector => {
-            try std.fmt.format(
-                stderr,
-                "[error] workspace selector '{s}' is ambiguous for machine '{s}'\n" ++
-                    "[hint] use the full local path or remote path to disambiguate\n",
-                .{ command.workspace_selector.?, command.machine_name },
-            );
-            return error.HandledFailure;
-        },
-        error.NoTrackedWorkspace => {
-            try std.fmt.format(
-                stderr,
-                "[error] machine '{s}' has no tracked workspace yet\n" ++
-                    "[hint] run `rove sync {s}` or `rove offload {s}` first\n",
-                .{ command.machine_name, command.machine_name, command.machine_name },
-            );
-            return error.HandledFailure;
-        },
-        else => return err,
-    };
-    defer resolved.deinit(allocator);
-
-    var preview = sync.previewPullWorkspace(allocator, machine, resolved) catch |err| {
-        try std.fmt.format(
-            stderr,
-            "[error] workspace pull preview failed for machine '{s}': {s}\n",
+            "[error] failed to execute command on machine '{s}': {s}\n",
             .{ command.machine_name, @errorName(err) },
         );
         return error.HandledFailure;
     };
-    defer preview.deinit(allocator);
-    const has_changes = preview.hasChanges();
+    defer result.deinit(allocator);
 
-    if (command.preview) {
-        try std.fmt.format(
-            stdout,
-            "[info] previewing pull from {s} to '{s}'\n",
-            .{ resolved.remote_root, resolved.local_root },
-        );
+    if (result.stdout.len > 0) try stdout.writeAll(result.stdout);
+    if (result.stderr.len > 0) try stderr.writeAll(result.stderr);
 
-        if (has_changes) {
-            try stdout.writeAll(preview.changes);
-        } else {
-            try stdout.writeAll("[info] no remote changes detected\n");
+    if (!result.succeeded()) {
+        switch (result.term) {
+            .Exited => |code| try std.fmt.format(stderr, "[error] remote command exited with code {d}\n", .{code}),
+            else => try stderr.writeAll("[error] remote command ended unexpectedly\n"),
         }
-        return;
-    }
-
-    const local_dirty = try workspace.localRepoHasUncommittedChanges(allocator, resolved.local_root);
-    if (local_dirty and has_changes and !command.force) {
-        try std.fmt.format(
-            stderr,
-            "[error] local workspace '{s}' has uncommitted git changes\n" ++
-                "[hint] run `rove pull {s} --preview` to inspect remote changes or `rove pull {s} --force` to continue\n",
-            .{ resolved.local_root, command.machine_name, command.machine_name },
-        );
         return error.HandledFailure;
     }
-
-    if (has_changes) {
-        try std.fmt.format(
-            stdout,
-            "[info] pulling workspace from {s} to '{s}'\n",
-            .{ resolved.remote_root, resolved.local_root },
-        );
-        if (local_dirty and command.force) {
-            try stdout.writeAll("[info] local git repo is dirty; continuing because --force was set\n");
-        }
-    } else {
-        try stdout.writeAll("[info] no remote changes detected\n");
-    }
-
-    const tracked_workspaces = try workspace.mergeTracked(allocator, machine, workspace.buildRecord(resolved, null));
-    defer tracked_workspaces.deinit(allocator);
-
-    if (has_changes) {
-        machine.status = .pulling;
-        try state.upsertMachine(allocator, machine, null);
-
-        sync.pullWorkspaceFiles(allocator, machine, resolved) catch |err| {
-            machine.status = .pull_failed;
-            try state.upsertMachine(allocator, machine, null);
-
-            try std.fmt.format(
-                stderr,
-                "[error] workspace pull failed for machine '{s}': {s}\n",
-                .{ command.machine_name, @errorName(err) },
-            );
-            return error.HandledFailure;
-        };
-    }
-
-    machine.workspace = tracked_workspaces.active;
-    machine.workspaces = tracked_workspaces.records;
-    machine.status = .ready;
-    try state.upsertMachine(allocator, machine, null);
-
-    if (has_changes) {
-        try std.fmt.format(
-            stdout,
-            "[info] workspace pulled for machine '{s}'\n",
-            .{command.machine_name},
-        );
-    } else {
-        try std.fmt.format(
-            stdout,
-            "[info] workspace already up to date for machine '{s}'\n",
-            .{command.machine_name},
-        );
-    }
-}
-
-fn handleOffload(
-    allocator: std.mem.Allocator,
-    stdout: anytype,
-    stderr: anytype,
-    command: WorkspaceTargetCommand,
-) !void {
-    var loaded_state = try state.loadOrEmpty(allocator, null);
-    defer loaded_state.deinit();
-
-    const machine_ptr = state.findMachine(&loaded_state.value, command.machine_name) orelse {
-        try std.fmt.format(
-            stderr,
-            "[error] no tracked machine named '{s}'\n" ++
-                "[hint] run a target first so there is a machine to offload into\n",
-            .{command.machine_name},
-        );
-        return error.HandledFailure;
-    };
-
-    if (machine_ptr.status == .destroying) {
-        try std.fmt.format(
-            stderr,
-            "[error] machine '{s}' is being destroyed\n",
-            .{command.machine_name},
-        );
-        return error.HandledFailure;
-    }
-
-    var machine = machine_ptr.*;
-    if (command.workspace_selector) |selector| {
-        const tracked = try resolveTrackedWorkspaceRecord(stderr, machine, command.machine_name, selector);
-        const resolved = try workspace.fromRecord(allocator, tracked);
-        defer resolved.deinit(allocator);
-
-        const planned = tmux.PlannedRestore{
-            .backend = .tracked,
-            .restore = try tmux.planTrackedWorkspaceSession(allocator, resolved, tracked.tmux_session),
-        };
-        defer planned.deinit(allocator);
-
-        try performOffload(allocator, stdout, stderr, &machine, command.machine_name, resolved, planned);
-        return;
-    }
-
-    const resolved = try workspace.discover(allocator, machine);
-    defer resolved.deinit(allocator);
-
-    var loaded_config: ?std.json.Parsed(model.ConfigFile) = config.load(allocator, null) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => return err,
-    };
-    defer if (loaded_config) |*parsed| parsed.deinit();
-
-    const planned = planned: {
-        if (loaded_config) |*parsed| {
-            const config_target_name = machine.target_name orelse machine.name;
-            const target = config.resolveTarget(&parsed.value, config_target_name) catch |err| switch (err) {
-                error.TargetNotFound => break :planned try tmux.planOffload(allocator, .{}, resolved),
-                else => return err,
-            };
-            break :planned try tmux.planOffload(allocator, target.tmux, resolved);
-        }
-
-        break :planned try tmux.planOffload(allocator, .{}, resolved);
-    };
-    defer planned.deinit(allocator);
-
-    try performOffload(allocator, stdout, stderr, &machine, command.machine_name, resolved, planned);
 }
 
 fn handleDown(
     allocator: std.mem.Allocator,
     stdout: anytype,
-    target_name: []const u8,
+    stderr: anytype,
+    command: MachineCommand,
 ) !void {
     var loaded_state = try state.loadOrEmpty(allocator, null);
     defer loaded_state.deinit();
 
-    const machine = state.findMachine(&loaded_state.value, target_name) orelse {
+    const machine = state.findMachine(&loaded_state.value, command.machine_name) orelse {
         try std.fmt.format(
-            stdout,
+            stderr,
             "[error] no tracked machine named '{s}'\n" ++
                 "[hint] nothing to destroy until a machine has been run at least once\n",
-            .{target_name},
+            .{command.machine_name},
         );
         return error.HandledFailure;
     };
@@ -1534,49 +1193,78 @@ fn handleDown(
     destroying.status = .destroying;
     try state.upsertMachine(allocator, destroying, null);
 
-    provider.destroy(allocator, machine.provider, .{
-        .app = machine.app orelse {
-            try std.fmt.format(
-                stdout,
-                "[error] tracked machine '{s}' is missing app metadata\n",
-                .{target_name},
-            );
+    const machine_provider_config = providerConfigForMachine(machine.*) catch |err| switch (err) {
+        error.MissingProviderScope => {
+            try std.fmt.format(stderr, "[error] tracked machine '{s}' is missing provider scope metadata\n", .{command.machine_name});
             return error.HandledFailure;
         },
+        else => return err,
+    };
+
+    provider.destroy(allocator, machine.provider, .{
+        .provider_config = machine_provider_config,
         .machine_id = machine.id,
     }) catch |err| {
-        try std.fmt.format(
-            stdout,
-            "[error] failed to destroy machine '{s}': {s}\n",
-            .{ target_name, @errorName(err) },
-        );
+        try std.fmt.format(stderr, "[error] failed to destroy machine '{s}': {s}\n", .{ command.machine_name, @errorName(err) });
         return error.HandledFailure;
     };
 
-    _ = try state.removeMachine(allocator, target_name, null);
+    _ = try state.removeMachine(allocator, command.machine_name, null);
+
+    if (command.format == .json) {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+
+        try out.writer.writeAll("{\"destroyed\":true,\"machine\":");
+        try appendMachineJson(&out, machine.*);
+        try out.writer.writeAll("}\n");
+        try stdout.writeAll(out.written());
+        return;
+    }
 
     try std.fmt.format(
         stdout,
         "[info] machine '{s}' destroyed\n" ++
             "[info] machine_id: {s}\n" ++
             "[hint] local state has been cleared\n",
-        .{ target_name, machine.id },
+        .{ command.machine_name, machine.id },
     );
+}
+
+fn renderRemoteCommand(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    for (argv, 0..) |part, index| {
+        if (index > 0) try writer.writer.writeByte(' ');
+        const quoted = try shell.quote(allocator, part);
+        defer allocator.free(quoted);
+        try writer.writer.writeAll(quoted);
+    }
+
+    return allocator.dupe(u8, writer.written());
 }
 
 fn renderPlacementSummary(
     allocator: std.mem.Allocator,
     target: model.TargetConfig,
 ) ![]u8 {
-    if (target.region) |region| {
-        return std.fmt.allocPrint(allocator, "fixed region {s}", .{region});
-    }
+    switch (target.provider) {
+        .fly => {
+            const fly_config = config.resolveFlyTarget(target);
+            if (fly_config.region) |region| {
+                return std.fmt.allocPrint(allocator, "fixed region {s}", .{region});
+            }
 
-    if (target.region_preference) |preference| {
-        const joined = try std.mem.join(allocator, ",", preference);
-        defer allocator.free(joined);
-
-        return std.fmt.allocPrint(allocator, "flexible preference {s}", .{joined});
+            if (fly_config.region_preference) |preference| {
+                const joined = try std.mem.join(allocator, ",", preference);
+                defer allocator.free(joined);
+                return std.fmt.allocPrint(allocator, "flexible preference {s}", .{joined});
+            }
+        },
     }
 
     return allocator.dupe(u8, "runtime-selected region");
@@ -1598,21 +1286,29 @@ const RefreshedMachine = struct {
     }
 };
 
+const RefreshReport = struct {
+    refreshed: RefreshedMachine,
+    result: []const u8,
+    pruned: bool = false,
+
+    fn deinit(self: RefreshReport, allocator: std.mem.Allocator) void {
+        self.refreshed.deinit(allocator);
+    }
+};
+
 fn refreshMachineFromProvider(
     allocator: std.mem.Allocator,
     machine: model.MachineRecord,
 ) !RefreshedMachine {
-    var refreshed = RefreshedMachine{
-        .value = machine,
-    };
+    var refreshed = RefreshedMachine{ .value = machine };
 
-    const app = machine.app orelse {
+    const machine_provider_config = providerConfigForMachine(machine) catch {
         refreshed.value.remote_state = "unknown";
         return refreshed;
     };
 
     const inspected = try provider.inspect(allocator, machine.provider, .{
-        .app = app,
+        .provider_config = machine_provider_config,
         .machine_id = machine.id,
     });
 
@@ -1647,13 +1343,12 @@ fn refreshMachineFromProvider(
     return refreshed;
 }
 
-fn refreshAndReportMachine(
+fn refreshMachineForReport(
     allocator: std.mem.Allocator,
-    stdout: anytype,
     stderr: anytype,
     machine: model.MachineRecord,
     prune_missing: bool,
-) !void {
+) !RefreshReport {
     var refreshed = refreshMachineFromProvider(allocator, machine) catch |err| {
         try std.fmt.format(
             stderr,
@@ -1662,29 +1357,53 @@ fn refreshAndReportMachine(
         );
         return error.HandledFailure;
     };
-    defer refreshed.deinit(allocator);
+    errdefer refreshed.deinit(allocator);
 
     if (prune_missing and refreshed.missing) {
         _ = try state.removeMachine(allocator, machine.name, null);
-        try std.fmt.format(
-            stdout,
-            "{s}\tpruned\t{s}\tmissing\t-\n",
-            .{ machine.name, model.statusName(refreshed.value.status) },
-        );
-        return;
+        return .{
+            .refreshed = refreshed,
+            .result = "pruned",
+            .pruned = true,
+        };
     }
 
     try state.upsertMachine(allocator, refreshed.value, null);
+
+    return .{
+        .refreshed = refreshed,
+        .result = if (refreshed.missing) "missing" else "updated",
+    };
+}
+
+fn refreshAndReportMachine(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    stderr: anytype,
+    machine: model.MachineRecord,
+    prune_missing: bool,
+) !void {
+    const report = try refreshMachineForReport(allocator, stderr, machine, prune_missing);
+    defer report.deinit(allocator);
+
+    if (report.pruned) {
+        try std.fmt.format(
+            stdout,
+            "{s}\tpruned\t{s}\tmissing\t-\n",
+            .{ machine.name, model.statusName(report.refreshed.value.status) },
+        );
+        return;
+    }
 
     try std.fmt.format(
         stdout,
         "{s}\t{s}\t{s}\t{s}\t{s}\n",
         .{
             machine.name,
-            if (refreshed.missing) "missing" else "updated",
-            model.statusName(refreshed.value.status),
-            refreshed.value.remote_state orelse "-",
-            refreshed.value.host,
+            report.result,
+            model.statusName(report.refreshed.value.status),
+            report.refreshed.value.remote_state orelse "-",
+            report.refreshed.value.host,
         },
     );
 }
@@ -1752,9 +1471,9 @@ fn doctorExecCheck(
 
     if (!result.succeeded()) {
         has_errors.* = true;
-        const stderr = std.mem.trim(u8, result.stderr, "\r\n\t ");
-        const detail = if (stderr.len > 0)
-            std.fmt.allocPrint(allocator, "{s}: {s}", .{ check_name, stderr }) catch return
+        const trimmed = std.mem.trim(u8, result.stderr, "\r\n\t ");
+        const detail = if (trimmed.len > 0)
+            std.fmt.allocPrint(allocator, "{s}: {s}", .{ check_name, trimmed }) catch return
         else
             std.fmt.allocPrint(allocator, "{s}: command failed", .{check_name}) catch return;
         defer allocator.free(detail);
@@ -1776,6 +1495,20 @@ fn printDoctorRow(
 
 fn isPinnedImageRef(image: []const u8) bool {
     return std.mem.indexOf(u8, image, "@sha256:") != null;
+}
+
+fn providerConfigForTarget(target: model.TargetConfig) provider.ProviderTargetConfig {
+    return switch (target.provider) {
+        .fly => .{ .fly = config.resolveFlyTarget(target) },
+    };
+}
+
+fn providerConfigForMachine(machine: model.MachineRecord) !provider.ProviderTargetConfig {
+    return switch (machine.provider) {
+        .fly => .{ .fly = .{
+            .app = machine.provider_scope orelse machine.app orelse return error.MissingProviderScope,
+        } },
+    };
 }
 
 fn lifecycleFromRemoteState(
@@ -1807,211 +1540,6 @@ fn lifecycleFromRemoteState(
     return fallback;
 }
 
-fn resolveTrackedWorkspaceRecord(
-    stderr: anytype,
-    machine: model.MachineRecord,
-    machine_name: []const u8,
-    selector: []const u8,
-) !model.WorkspaceRecord {
-    return workspace.resolveTrackedSelector(machine, selector) catch |err| switch (err) {
-        error.WorkspaceNotFound => {
-            try std.fmt.format(
-                stderr,
-                "[error] machine '{s}' has no tracked workspace matching '{s}'\n" ++
-                    "[hint] use `active`, an index, a label, a local path, or a remote path from `rove workspaces {s}`\n",
-                .{ machine_name, selector, machine_name },
-            );
-            return error.HandledFailure;
-        },
-        error.AmbiguousWorkspaceSelector => {
-            try std.fmt.format(
-                stderr,
-                "[error] workspace selector '{s}' is ambiguous for machine '{s}'\n" ++
-                    "[hint] use the full local path or remote path to disambiguate\n",
-                .{ selector, machine_name },
-            );
-            return error.HandledFailure;
-        },
-        else => return err,
-    };
-}
-
-fn openWorkspaceSsh(
-    allocator: std.mem.Allocator,
-    stderr: anytype,
-    machine: model.MachineRecord,
-    machine_name: []const u8,
-    selector: []const u8,
-) !std.process.Child.Term {
-    const tracked = try resolveTrackedWorkspaceRecord(stderr, machine, machine_name, selector);
-    return openTrackedWorkspaceSsh(allocator, stderr, machine, machine_name, tracked, selector);
-}
-
-fn openTrackedWorkspaceSsh(
-    allocator: std.mem.Allocator,
-    stderr: anytype,
-    machine: model.MachineRecord,
-    machine_name: []const u8,
-    tracked: model.WorkspaceRecord,
-    selector_label: []const u8,
-) !std.process.Child.Term {
-    const resolved = try workspace.fromRecord(allocator, tracked);
-    defer resolved.deinit(allocator);
-
-    const planned = try tmux.planTrackedWorkspaceSession(allocator, resolved, tracked.tmux_session);
-    defer planned.deinit(allocator);
-
-    tmux.applyRemote(allocator, machine, planned) catch |err| {
-        try std.fmt.format(
-            stderr,
-            "[error] failed to prepare tmux workspace '{s}' on machine '{s}': {s}\n",
-            .{ selector_label, machine_name, @errorName(err) },
-        );
-        return error.HandledFailure;
-    };
-
-    const attach_command = try tmux.attachCommand(allocator, planned);
-    defer allocator.free(attach_command);
-
-    return ssh.openInteractiveCommand(allocator, machine, attach_command) catch |err| {
-        try std.fmt.format(
-            stderr,
-            "[error] failed to start workspace ssh for machine '{s}': {s}\n",
-            .{ machine_name, @errorName(err) },
-        );
-        return error.HandledFailure;
-    };
-}
-
-fn openRawSsh(
-    allocator: std.mem.Allocator,
-    stderr: anytype,
-    machine: model.MachineRecord,
-    machine_name: []const u8,
-) !std.process.Child.Term {
-    return ssh.openInteractive(allocator, machine) catch |err| {
-        try std.fmt.format(
-            stderr,
-            "[error] failed to start ssh for machine '{s}': {s}\n",
-            .{ machine_name, @errorName(err) },
-        );
-        return error.HandledFailure;
-    };
-}
-
-fn performOffload(
-    allocator: std.mem.Allocator,
-    stdout: anytype,
-    stderr: anytype,
-    machine: *model.MachineRecord,
-    machine_name: []const u8,
-    resolved: workspace.ResolvedWorkspace,
-    planned: tmux.PlannedRestore,
-) !void {
-    machine.status = .offloading;
-    try state.upsertMachine(allocator, machine.*, null);
-
-    try std.fmt.format(
-        stdout,
-        "[info] syncing workspace '{s}' to {s}\n" ++
-            "[info] tmux backend: {s}\n" ++
-            "[info] restoring tmux session '{s}'\n",
-        .{ resolved.local_root, resolved.remote_root, tmux.backendName(planned.backend), planned.restore.session_name },
-    );
-
-    const ran_bootstrap_hook = try syncResolvedWorkspace(
-        allocator,
-        stderr,
-        machine,
-        machine_name,
-        resolved,
-        .offloading,
-        .offload_failed,
-        .{},
-    );
-
-    tmux.applyRemote(allocator, machine.*, planned.restore) catch |err| {
-        machine.status = .offload_failed;
-        try state.upsertMachine(allocator, machine.*, null);
-
-        try std.fmt.format(
-            stderr,
-            "[error] tmux restore failed for machine '{s}': {s}\n",
-            .{ machine_name, @errorName(err) },
-        );
-        return error.HandledFailure;
-    };
-
-    const tracked_workspaces = try workspace.mergeTracked(allocator, machine.*, workspace.buildRecord(resolved, planned.restore.session_name));
-    defer tracked_workspaces.deinit(allocator);
-
-    machine.workspace = tracked_workspaces.active;
-    machine.workspaces = tracked_workspaces.records;
-    machine.status = .ready;
-    try state.upsertMachine(allocator, machine.*, null);
-
-    if (ran_bootstrap_hook) {
-        try stdout.writeAll("[info] ran repo-local bootstrap hook .rove/bootstrap.sh\n");
-    }
-
-    const attach_command = try tmux.attachCommand(allocator, planned.restore);
-    defer allocator.free(attach_command);
-
-    const term = ssh.openInteractiveCommand(allocator, machine.*, attach_command) catch |err| {
-        try std.fmt.format(
-            stderr,
-            "[error] failed to attach remote tmux for machine '{s}': {s}\n",
-            .{ machine_name, @errorName(err) },
-        );
-        return error.HandledFailure;
-    };
-
-    switch (term) {
-        .Exited => |code| {
-            if (code != 0) {
-                try std.fmt.format(
-                    stderr,
-                    "[error] remote tmux attach exited with code {d}\n",
-                    .{code},
-                );
-                return error.HandledFailure;
-            }
-        },
-        else => {
-            try stderr.writeAll("[error] remote tmux attach ended unexpectedly\n");
-            return error.HandledFailure;
-        },
-    }
-}
-
-fn syncResolvedWorkspace(
-    allocator: std.mem.Allocator,
-    stderr: anytype,
-    machine: *model.MachineRecord,
-    machine_name: []const u8,
-    resolved: workspace.ResolvedWorkspace,
-    active_status: model.LifecycleStatus,
-    failure_status: model.LifecycleStatus,
-    sync_options: sync.SyncOptions,
-) !bool {
-    machine.status = active_status;
-    try state.upsertMachine(allocator, machine.*, null);
-
-    const result = sync.syncWorkspace(allocator, machine.*, resolved, sync_options) catch |err| {
-        machine.status = failure_status;
-        try state.upsertMachine(allocator, machine.*, null);
-
-        try std.fmt.format(
-            stderr,
-            "[error] workspace sync failed for machine '{s}': {s}\n",
-            .{ machine_name, @errorName(err) },
-        );
-        return error.HandledFailure;
-    };
-
-    return result.ran_bootstrap_hook;
-}
-
 fn isValidInstanceName(name: []const u8) bool {
     if (name.len == 0) return false;
 
@@ -2023,204 +1551,108 @@ fn isValidInstanceName(name: []const u8) bool {
     return true;
 }
 
-test "parse status" {
-    const command = try parse(&.{"status"});
+test "parse up target with explicit name and json" {
+    const command = try parse(&.{ "up", "devbox", "--json", "--name", "work" });
 
     switch (command) {
-        .status => {},
+        .up => |run_command| {
+            try std.testing.expectEqualStrings("devbox", run_command.target);
+            try std.testing.expectEqualStrings("work", run_command.name.?);
+            try std.testing.expectEqual(OutputFormat.json, run_command.format);
+        },
         else => return error.InvalidArguments,
     }
 }
 
-test "parse refresh all with prune" {
-    const command = try parse(&.{ "refresh", "--prune-missing" });
+test "parse run alias" {
+    const command = try parse(&.{ "run", "devbox" });
+
+    switch (command) {
+        .run => |run_command| try std.testing.expectEqualStrings("devbox", run_command.target),
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse status target" {
+    const command = try parse(&.{ "status", "work", "--json" });
+
+    switch (command) {
+        .status => |status_command| {
+            try std.testing.expectEqualStrings("work", status_command.machine_name.?);
+            try std.testing.expectEqual(OutputFormat.json, status_command.format);
+        },
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse inspect target" {
+    const command = try parse(&.{ "inspect", "work", "--json" });
+
+    switch (command) {
+        .inspect => |machine_command| {
+            try std.testing.expectEqualStrings("work", machine_command.machine_name);
+            try std.testing.expectEqual(OutputFormat.json, machine_command.format);
+        },
+        else => return error.InvalidArguments,
+    }
+}
+
+test "parse refresh all with prune and json" {
+    const command = try parse(&.{ "refresh", "--prune-missing", "--json" });
 
     switch (command) {
         .refresh => |refresh_command| {
             try std.testing.expect(refresh_command.machine_name == null);
             try std.testing.expect(refresh_command.prune_missing);
+            try std.testing.expectEqual(OutputFormat.json, refresh_command.format);
         },
         else => return error.InvalidArguments,
     }
 }
 
-test "parse refresh target" {
-    const command = try parse(&.{ "refresh", "sam-east" });
-
-    switch (command) {
-        .refresh => |refresh_command| {
-            try std.testing.expectEqualStrings("sam-east", refresh_command.machine_name.?);
-            try std.testing.expect(!refresh_command.prune_missing);
-        },
-        else => return error.InvalidArguments,
-    }
-}
-
-test "parse doctor target" {
-    const command = try parse(&.{ "doctor", "sam-east" });
-
-    switch (command) {
-        .doctor => |doctor_command| try std.testing.expectEqualStrings("sam-east", doctor_command.machine_name.?),
-        else => return error.InvalidArguments,
-    }
-}
-
-test "parse adopt target" {
-    const command = try parse(&.{ "adopt", "devbox", "machine-123", "--name", "sam-east" });
+test "parse adopt target with json" {
+    const command = try parse(&.{ "adopt", "devbox", "machine-123", "--json", "--name", "recovered" });
 
     switch (command) {
         .adopt => |adopt_command| {
             try std.testing.expectEqualStrings("devbox", adopt_command.target);
             try std.testing.expectEqualStrings("machine-123", adopt_command.machine_id);
-            try std.testing.expectEqualStrings("sam-east", adopt_command.name.?);
+            try std.testing.expectEqualStrings("recovered", adopt_command.name.?);
+            try std.testing.expectEqual(OutputFormat.json, adopt_command.format);
         },
         else => return error.InvalidArguments,
     }
 }
 
-test "parse auth target" {
-    const command = try parse(&.{ "auth", "sam-east" });
+test "parse down with json" {
+    const command = try parse(&.{ "down", "work", "--json" });
 
     switch (command) {
-        .auth => |auth_command| {
-            try std.testing.expectEqualStrings("sam-east", auth_command.machine_name);
-            try std.testing.expect(!auth_command.copy_gh);
+        .down => |machine_command| {
+            try std.testing.expectEqualStrings("work", machine_command.machine_name);
+            try std.testing.expectEqual(OutputFormat.json, machine_command.format);
         },
         else => return error.InvalidArguments,
     }
 }
 
-test "parse auth target with copy gh" {
-    const command = try parse(&.{ "auth", "sam-east", "--copy-gh" });
+test "parse exec command" {
+    const command = try parse(&.{ "exec", "work", "--", "uname", "-a" });
 
     switch (command) {
-        .auth => |auth_command| {
-            try std.testing.expectEqualStrings("sam-east", auth_command.machine_name);
-            try std.testing.expect(auth_command.copy_gh);
+        .exec => |exec_command| {
+            try std.testing.expectEqualStrings("work", exec_command.machine_name);
+            try std.testing.expectEqual(@as(usize, 2), exec_command.argv.len);
+            try std.testing.expectEqualStrings("uname", exec_command.argv[0]);
         },
         else => return error.InvalidArguments,
     }
 }
 
-test "parse run target" {
-    const command = try parse(&.{ "run", "gpu" });
+test "render remote command quotes argv" {
+    const allocator = std.testing.allocator;
+    const rendered = try renderRemoteCommand(allocator, &.{ "sh", "-lc", "echo hello && pwd" });
+    defer allocator.free(rendered);
 
-    switch (command) {
-        .run => |run_command| {
-            try std.testing.expectEqualStrings("gpu", run_command.target);
-            try std.testing.expect(run_command.name == null);
-        },
-        else => return error.InvalidArguments,
-    }
-}
-
-test "parse run target with explicit name" {
-    const command = try parse(&.{ "run", "devbox", "--name", "sam-east" });
-
-    switch (command) {
-        .run => |run_command| {
-            try std.testing.expectEqualStrings("devbox", run_command.target);
-            try std.testing.expectEqualStrings("sam-east", run_command.name.?);
-        },
-        else => return error.InvalidArguments,
-    }
-}
-
-test "parse sync target" {
-    const command = try parse(&.{ "sync", "sam-east" });
-
-    switch (command) {
-        .sync => |sync_command| {
-            try std.testing.expectEqualStrings("sam-east", sync_command.machine_name);
-            try std.testing.expect(!sync_command.preview);
-            try std.testing.expect(!sync_command.delete);
-        },
-        else => return error.InvalidArguments,
-    }
-}
-
-test "parse sync target with preview and delete" {
-    const command = try parse(&.{ "sync", "sam-east", "--preview", "--delete" });
-
-    switch (command) {
-        .sync => |sync_command| {
-            try std.testing.expectEqualStrings("sam-east", sync_command.machine_name);
-            try std.testing.expect(sync_command.preview);
-            try std.testing.expect(sync_command.delete);
-        },
-        else => return error.InvalidArguments,
-    }
-}
-
-test "parse workspaces target" {
-    const command = try parse(&.{ "workspaces", "sam-east" });
-
-    switch (command) {
-        .workspaces => |name| try std.testing.expectEqualStrings("sam-east", name),
-        else => return error.InvalidArguments,
-    }
-}
-
-test "parse pull target" {
-    const command = try parse(&.{ "pull", "sam-east" });
-
-    switch (command) {
-        .pull => |pull_command| {
-            try std.testing.expectEqualStrings("sam-east", pull_command.machine_name);
-            try std.testing.expect(!pull_command.preview);
-            try std.testing.expect(!pull_command.force);
-            try std.testing.expect(pull_command.workspace_selector == null);
-        },
-        else => return error.InvalidArguments,
-    }
-}
-
-test "parse pull target with preview and force" {
-    const command = try parse(&.{ "pull", "sam-east", "--workspace", "$HOME/work/repo", "--preview", "--force" });
-
-    switch (command) {
-        .pull => |pull_command| {
-            try std.testing.expectEqualStrings("sam-east", pull_command.machine_name);
-            try std.testing.expect(pull_command.preview);
-            try std.testing.expect(pull_command.force);
-            try std.testing.expectEqualStrings("$HOME/work/repo", pull_command.workspace_selector.?);
-        },
-        else => return error.InvalidArguments,
-    }
-}
-
-test "parse ssh target with workspace selector" {
-    const command = try parse(&.{ "ssh", "sam-east", "--workspace", "project" });
-
-    switch (command) {
-        .ssh => |ssh_command| {
-            try std.testing.expectEqualStrings("sam-east", ssh_command.machine_name);
-            try std.testing.expectEqualStrings("project", ssh_command.workspace_selector.?);
-        },
-        else => return error.InvalidArguments,
-    }
-}
-
-test "parse offload target with workspace selector" {
-    const command = try parse(&.{ "offload", "sam-east", "--workspace", "$HOME/work/project" });
-
-    switch (command) {
-        .offload => |offload_command| {
-            try std.testing.expectEqualStrings("sam-east", offload_command.machine_name);
-            try std.testing.expectEqualStrings("$HOME/work/project", offload_command.workspace_selector.?);
-        },
-        else => return error.InvalidArguments,
-    }
-}
-
-test "reject missing target" {
-    try std.testing.expectError(error.InvalidArguments, parse(&.{"ssh"}));
-}
-
-test "reject run name without value" {
-    try std.testing.expectError(error.InvalidArguments, parse(&.{ "run", "devbox", "--name" }));
-}
-
-test "reject unknown command" {
-    try std.testing.expectError(error.InvalidArguments, parse(&.{ "launch", "gpu" }));
+    try std.testing.expectEqualStrings("'sh' '-lc' 'echo hello && pwd'", rendered);
 }

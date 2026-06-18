@@ -193,52 +193,6 @@ pub fn openInteractiveCommand(
     return exec.runInteractive(allocator, args.items);
 }
 
-pub fn rsyncTransportCommand(
-    allocator: std.mem.Allocator,
-    machine: model.MachineRecord,
-) ![]u8 {
-    const connection = try prepareConnection(allocator, machine);
-    defer connection.deinit(allocator);
-
-    const parts = [_][]const u8{
-        "ssh",
-        "-i",
-        connection.identity_file,
-        "-o",
-        "IdentitiesOnly=yes",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "PreferredAuthentications=publickey",
-        "-o",
-        "ForwardAgent=no",
-        "-o",
-        "ClearAllForwardings=yes",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        "-o",
-        connection.user_known_hosts,
-        "-o",
-        connection.host_key_alias,
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "LogLevel=ERROR",
-    };
-
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    defer writer.deinit();
-
-    for (parts, 0..) |part, index| {
-        if (index > 0) try writer.writer.writeByte(' ');
-        const quoted = try shell.quote(allocator, part);
-        defer allocator.free(quoted);
-        try writer.writer.writeAll(quoted);
-    }
-
-    return allocator.dupe(u8, writer.written());
-}
-
 fn prepareConnection(
     allocator: std.mem.Allocator,
     machine: model.MachineRecord,
@@ -293,14 +247,7 @@ fn wrappedRemoteCommand(
     allocator: std.mem.Allocator,
     remote_command: []const u8,
 ) ![]u8 {
-    const script = try std.fmt.allocPrint(
-        allocator,
-        "export PATH=\"$HOME/.local/share/rove/devbox-profile/bin:$HOME/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {s}",
-        .{remote_command},
-    );
-    defer allocator.free(script);
-
-    const quoted = try shell.quote(allocator, script);
+    const quoted = try shell.quote(allocator, remote_command);
     defer allocator.free(quoted);
 
     return std.fmt.allocPrint(allocator, "/bin/bash -lc {s}", .{quoted});

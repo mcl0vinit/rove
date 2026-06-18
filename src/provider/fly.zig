@@ -8,6 +8,7 @@ pub fn create(
     allocator: std.mem.Allocator,
     request: provider.CreateRequest,
 ) !provider.CreateResult {
+    const fly_config = request.provider_config.fly;
     const machine_name = try generatedMachineName(allocator, request.instance_name);
     defer allocator.free(machine_name);
 
@@ -21,14 +22,14 @@ pub fn create(
         "flyctl",
         "machine",
         "run",
-        request.target.image,
+        fly_config.image,
         "--app",
-        request.target.app,
+        fly_config.app,
         "--detach",
         "--name",
         machine_name,
         "--vm-size",
-        request.target.vm_size,
+        fly_config.vm_size,
         "--port",
         "22:2222/tcp",
         "--metadata",
@@ -39,7 +40,7 @@ pub fn create(
     try args.append(allocator, managed_metadata);
 
     try args.append(allocator, "--metadata");
-    const target_metadata = try std.fmt.allocPrint(allocator, "rove_target={s}", .{request.target.name});
+    const target_metadata = try std.fmt.allocPrint(allocator, "rove_target={s}", .{request.target_name});
     defer allocator.free(target_metadata);
     try args.append(allocator, target_metadata);
 
@@ -53,7 +54,7 @@ pub fn create(
     defer allocator.free(authorized_keys_env);
     try args.append(allocator, authorized_keys_env);
 
-    if (selectedRegion(request.target.*)) |region| {
+    if (selectedRegion(fly_config)) |region| {
         try args.appendSlice(allocator, &.{ "--region", region });
     }
 
@@ -65,12 +66,12 @@ pub fn create(
         return error.CommandFailed;
     }
 
-    const machine = try lookupMachineByName(allocator, request.target.app, machine_name);
+    const machine = try lookupMachineByName(allocator, fly_config.app, machine_name);
     defer machine.deinit(allocator);
 
     return .{
         .machine_id = try allocator.dupe(u8, machine.id.?),
-        .host = try std.fmt.allocPrint(allocator, "{s}.fly.dev", .{request.target.app}),
+        .host = try std.fmt.allocPrint(allocator, "{s}.fly.dev", .{fly_config.app}),
         .region = if (machine.region) |region| try allocator.dupe(u8, region) else null,
         .machine_name = if (machine.name) |name| try allocator.dupe(u8, name) else null,
     };
@@ -80,12 +81,13 @@ pub fn destroy(
     allocator: std.mem.Allocator,
     request: provider.DestroyRequest,
 ) !void {
+    const fly_config = request.provider_config.fly;
     const result = try exec.run(allocator, &.{
         "flyctl",
         "machine",
         "destroy",
         "--app",
-        request.app,
+        fly_config.app,
         "--force",
         request.machine_id,
     });
@@ -101,7 +103,8 @@ pub fn inspect(
     allocator: std.mem.Allocator,
     request: provider.InspectRequest,
 ) !provider.InspectResult {
-    const machine = try lookupMachineById(allocator, request.app, request.machine_id);
+    const fly_config = request.provider_config.fly;
+    const machine = try lookupMachineById(allocator, fly_config.app, request.machine_id);
     defer machine.deinit(allocator);
 
     if (!machine.exists) {
@@ -113,7 +116,7 @@ pub fn inspect(
     return .{
         .exists = true,
         .machine_name = if (machine.name) |name| try allocator.dupe(u8, name) else null,
-        .host = try std.fmt.allocPrint(allocator, "{s}.fly.dev", .{request.app}),
+        .host = try std.fmt.allocPrint(allocator, "{s}.fly.dev", .{fly_config.app}),
         .region = if (machine.region) |region| try allocator.dupe(u8, region) else null,
         .remote_state = if (machine.state) |state| try allocator.dupe(u8, state) else null,
     };
@@ -198,7 +201,7 @@ fn machineNameSlug(
     return out.toOwnedSlice(allocator);
 }
 
-fn selectedRegion(target: model.TargetConfig) ?[]const u8 {
+fn selectedRegion(target: model.FlyTargetConfig) ?[]const u8 {
     if (target.region) |region| return region;
     if (target.region_preference) |preference| {
         if (preference.len > 0) return preference[0];

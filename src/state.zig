@@ -33,6 +33,7 @@ pub fn loadOrEmpty(
 
     var parsed = try std.json.parseFromSlice(model.StateFile, allocator, contents, .{
         .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
 

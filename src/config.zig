@@ -11,14 +11,8 @@ pub const Error = std.fs.File.OpenError ||
         EmptyTargetName,
         MissingApp,
         MissingImage,
-        MissingProfileInstallCommand,
-        MissingProfilePath,
-        MissingProfileRef,
-        MissingProfileRepo,
-        MissingTmuxCaptureScript,
         MissingVmSize,
         MissingSshUser,
-        MissingStartupScript,
         MissingRegionPreference,
         TargetNotFound,
     };
@@ -45,6 +39,7 @@ pub fn parseSlice(
 ) Error!std.json.Parsed(model.ConfigFile) {
     var parsed = try std.json.parseFromSlice(model.ConfigFile, allocator, contents, .{
         .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
 
@@ -66,47 +61,49 @@ pub fn resolveTarget(
     return error.TargetNotFound;
 }
 
+pub fn resolveFlyTarget(target: model.TargetConfig) model.FlyTargetConfig {
+    if (target.fly) |fly| {
+        return .{
+            .app = if (fly.app.len > 0) fly.app else target.app,
+            .image = if (fly.image.len > 0) fly.image else target.image,
+            .vm_size = if (fly.vm_size.len > 0) fly.vm_size else target.vm_size,
+            .region = fly.region orelse target.region,
+            .region_preference = fly.region_preference orelse target.region_preference,
+        };
+    }
+
+    return .{
+        .app = target.app,
+        .image = target.image,
+        .vm_size = target.vm_size,
+        .region = target.region,
+        .region_preference = target.region_preference,
+    };
+}
+
 fn validate(
     targets: []const model.TargetConfig,
     options: ValidationOptions,
 ) Error!void {
     for (targets, 0..) |target, index| {
         if (target.name.len == 0) return error.EmptyTargetName;
-        if (target.app.len == 0) return error.MissingApp;
-        if (target.image.len == 0) return error.MissingImage;
-        if (target.vm_size.len == 0) return error.MissingVmSize;
         if (target.ssh_user.len == 0) return error.MissingSshUser;
-        if (target.startup_script.len == 0) return error.MissingStartupScript;
 
-        if (target.region_preference) |preference| {
-            if (preference.len == 0) return error.MissingRegionPreference;
-        }
-
-        if (target.profile) |profile| {
-            if (profile.repo.len == 0) return error.MissingProfileRepo;
-            if (profile.ref) |ref| {
-                if (ref.len == 0) return error.MissingProfileRef;
-            }
-            if (profile.path) |path| {
-                if (path.len == 0) return error.MissingProfilePath;
-            }
-            if (profile.install_command) |install_command| {
-                if (install_command.len == 0) return error.MissingProfileInstallCommand;
-            }
-        }
-
-        switch (target.tmux.backend) {
-            .shape => {},
-            .hook, .auto => {
-                const capture_script = target.tmux.capture_script orelse return error.MissingTmuxCaptureScript;
-                if (capture_script.len == 0) return error.MissingTmuxCaptureScript;
+        switch (target.provider) {
+            .fly => {
+                const fly = resolveFlyTarget(target);
+                if (fly.app.len == 0) return error.MissingApp;
+                if (fly.image.len == 0) return error.MissingImage;
+                if (fly.vm_size.len == 0) return error.MissingVmSize;
+                if (fly.region_preference) |preference| {
+                    if (preference.len == 0) return error.MissingRegionPreference;
+                }
             },
         }
 
         if (options.check_startup_script_paths) {
-            try std.fs.cwd().access(target.startup_script, .{});
-            if (target.tmux.backend == .hook) {
-                try std.fs.cwd().access(target.tmux.capture_script.?, .{});
+            if (target.startup_script) |startup_script| {
+                try std.fs.cwd().access(startup_script, .{});
             }
         }
 
@@ -118,7 +115,7 @@ fn validate(
     }
 }
 
-test "parse and resolve target" {
+test "parse and resolve target with provider scoped fly config" {
     const allocator = std.testing.allocator;
     const contents =
         \\{
@@ -126,11 +123,13 @@ test "parse and resolve target" {
         \\    {
         \\      "name": "devbox",
         \\      "provider": "fly",
-        \\      "app": "devbox",
-        \\      "image": "registry.fly.io/devbox:latest",
-        \\      "vm_size": "shared-cpu-2x",
         \\      "ssh_user": "rove",
-        \\      "startup_script": "./scripts/bootstrap.sh"
+        \\      "startup_script": "./scripts/bootstrap.sh",
+        \\      "fly": {
+        \\        "app": "devbox",
+        \\        "image": "registry.fly.io/devbox:latest",
+        \\        "vm_size": "shared-cpu-2x"
+        \\      }
         \\    }
         \\  ]
         \\}
@@ -142,11 +141,15 @@ test "parse and resolve target" {
     defer parsed.deinit();
 
     const target = try resolveTarget(&parsed.value, "devbox");
-    try std.testing.expectEqualStrings("devbox", target.app);
     try std.testing.expectEqual(model.ProviderKind.fly, target.provider);
+
+    const fly = resolveFlyTarget(target.*);
+    try std.testing.expectEqualStrings("devbox", fly.app);
+    try std.testing.expectEqualStrings("registry.fly.io/devbox:latest", fly.image);
+    try std.testing.expectEqualStrings("shared-cpu-2x", fly.vm_size);
 }
 
-test "reject duplicate target names" {
+test "parse legacy top-level fly config" {
     const allocator = std.testing.allocator;
     const contents =
         \\{
@@ -157,17 +160,48 @@ test "reject duplicate target names" {
         \\      "app": "devbox",
         \\      "image": "registry.fly.io/devbox:latest",
         \\      "vm_size": "shared-cpu-2x",
+        \\      "ssh_user": "rove"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var parsed = try parseSlice(allocator, contents, ValidationOptions{
+        .check_startup_script_paths = false,
+    });
+    defer parsed.deinit();
+
+    const target = try resolveTarget(&parsed.value, "devbox");
+    const fly = resolveFlyTarget(target.*);
+    try std.testing.expectEqualStrings("devbox", fly.app);
+}
+
+test "reject duplicate target names" {
+    const allocator = std.testing.allocator;
+    const contents =
+        \\{
+        \\  "targets": [
+        \\    {
+        \\      "name": "devbox",
+        \\      "provider": "fly",
         \\      "ssh_user": "rove",
-        \\      "startup_script": "./scripts/bootstrap.sh"
+        \\      "startup_script": "./scripts/bootstrap.sh",
+        \\      "fly": {
+        \\        "app": "devbox",
+        \\        "image": "registry.fly.io/devbox:latest",
+        \\        "vm_size": "shared-cpu-2x"
+        \\      }
         \\    },
         \\    {
         \\      "name": "devbox",
         \\      "provider": "fly",
-        \\      "app": "devbox",
-        \\      "image": "registry.fly.io/devbox:latest",
-        \\      "vm_size": "shared-cpu-2x",
         \\      "ssh_user": "rove",
-        \\      "startup_script": "./scripts/bootstrap.sh"
+        \\      "startup_script": "./scripts/bootstrap.sh",
+        \\      "fly": {
+        \\        "app": "devbox",
+        \\        "image": "registry.fly.io/devbox:latest",
+        \\        "vm_size": "shared-cpu-2x"
+        \\      }
         \\    }
         \\  ]
         \\}
@@ -181,7 +215,7 @@ test "reject duplicate target names" {
     );
 }
 
-test "parse target with profile" {
+test "parse target without startup script" {
     const allocator = std.testing.allocator;
     const contents =
         \\{
@@ -189,15 +223,11 @@ test "parse target with profile" {
         \\    {
         \\      "name": "devbox",
         \\      "provider": "fly",
-        \\      "app": "devbox",
-        \\      "image": "registry.fly.io/devbox:latest",
-        \\      "vm_size": "shared-cpu-2x",
         \\      "ssh_user": "rove",
-        \\      "startup_script": "./scripts/bootstrap.sh",
-        \\      "profile": {
-        \\        "repo": "git@github.com:example/dotfiles.git",
-        \\        "ref": "main",
-        \\        "install_command": "./bin/bootstrap --apply"
+        \\      "fly": {
+        \\        "app": "devbox",
+        \\        "image": "registry.fly.io/devbox:latest",
+        \\        "vm_size": "shared-cpu-2x"
         \\      }
         \\    }
         \\  ]
@@ -210,68 +240,5 @@ test "parse target with profile" {
     defer parsed.deinit();
 
     const target = try resolveTarget(&parsed.value, "devbox");
-    try std.testing.expect(target.profile != null);
-    try std.testing.expectEqualStrings("git@github.com:example/dotfiles.git", target.profile.?.repo);
-    try std.testing.expectEqualStrings("./bin/bootstrap --apply", target.profile.?.install_command.?);
-}
-
-test "parse target with auto tmux hook" {
-    const allocator = std.testing.allocator;
-    const contents =
-        \\{
-        \\  "targets": [
-        \\    {
-        \\      "name": "devbox",
-        \\      "provider": "fly",
-        \\      "app": "devbox",
-        \\      "image": "registry.fly.io/devbox:latest",
-        \\      "vm_size": "shared-cpu-2x",
-        \\      "ssh_user": "rove",
-        \\      "startup_script": "./scripts/bootstrap.sh",
-        \\      "tmux": {
-        \\        "backend": "auto",
-        \\        "capture_script": "/tmp/tmux-capture"
-        \\      }
-        \\    }
-        \\  ]
-        \\}
-    ;
-
-    var parsed = try parseSlice(allocator, contents, ValidationOptions{
-        .check_startup_script_paths = false,
-    });
-    defer parsed.deinit();
-
-    const target = try resolveTarget(&parsed.value, "devbox");
-    try std.testing.expectEqual(model.TmuxBackendKind.auto, target.tmux.backend);
-    try std.testing.expectEqualStrings("/tmp/tmux-capture", target.tmux.capture_script.?);
-}
-
-test "reject tmux hook config without capture script" {
-    const allocator = std.testing.allocator;
-    const contents =
-        \\{
-        \\  "targets": [
-        \\    {
-        \\      "name": "devbox",
-        \\      "provider": "fly",
-        \\      "app": "devbox",
-        \\      "image": "registry.fly.io/devbox:latest",
-        \\      "vm_size": "shared-cpu-2x",
-        \\      "ssh_user": "rove",
-        \\      "startup_script": "./scripts/bootstrap.sh",
-        \\      "tmux": {
-        \\        "backend": "hook"
-        \\      }
-        \\    }
-        \\  ]
-        \\}
-    ;
-
-    try std.testing.expectError(
-        error.MissingTmuxCaptureScript,
-        parseSlice(allocator, contents, ValidationOptions{
-            .check_startup_script_paths = false,
-        }),
-    );
+    try std.testing.expect(target.startup_script == null);
 }

@@ -3,13 +3,12 @@
     {
       "name": "devbox",
       "provider": "fly",
-      "app": "your-fly-app",
-      "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
-      "vm_size": "shared-cpu-2x",
       "ssh_user": "rove",
       "startup_script": "./scripts/bootstrap.sh",
-      "tmux": {
-        "backend": "shape"
+      "fly": {
+        "app": "your-fly-app",
+        "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
+        "vm_size": "shared-cpu-2x"
       }
     }
   ]

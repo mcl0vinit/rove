@@ -157,10 +157,12 @@ The default `devbox` target now assumes dotfiles are already in the image, so it
 {
   "name": "devbox",
   "provider": "fly",
-  "app": "your-fly-app",
-  "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
-  "vm_size": "shared-cpu-2x",
   "ssh_user": "rove",
-  "startup_script": "./scripts/bootstrap.sh"
+  "startup_script": "./scripts/bootstrap.sh",
+  "fly": {
+    "app": "your-fly-app",
+    "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
+    "vm_size": "shared-cpu-2x"
+  }
 }
 ```

@@ -28,7 +28,11 @@ for config_path in "$@"; do
       .targets = (
         .targets | map(
           if .name == $target_name then
-            .image = $image_ref
+            if has("fly") then
+              .fly.image = $image_ref
+            else
+              .image = $image_ref
+            end
           else
             .
           end
