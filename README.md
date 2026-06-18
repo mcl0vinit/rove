@@ -5,8 +5,8 @@ Rove provisions and tracks disposable remote machines.
 Rove owns machine lifecycle, SSH reachability, bootstrap, provider reconciliation, and teardown. It deliberately does not own workspace sync, terminal session state, distributed search, or higher-level control-plane UX.
 
 The current V1 is narrow on purpose:
-- Fly Machines only
-- CPU devboxes by default
+- Fly Machines for CPU devboxes
+- Vast.ai instances for GPU workloads
 - pinned image refs
 - local JSON state in `~/.rove/state.json`
 - managed SSH keys and isolated known hosts
@@ -45,7 +45,7 @@ nix develop -c zig build test
 
 - `target`: a named machine definition in `rove.json`
 - `name`: a tracked machine instance name such as `work` or `gpu-east`
-- `provider`: the machine backend; currently only Fly is implemented
+- `provider`: the machine backend; currently `fly` and `vast`
 
 ## Quick Start
 
@@ -64,7 +64,7 @@ rove up devbox --name work
 rove ssh work
 ```
 
-## Example Config
+## Fly Example Config
 
 ```json
 {
@@ -87,6 +87,53 @@ rove ssh work
 `startup_script` is optional. If present, Rove uploads and runs it after SSH becomes reachable. Provider settings live under a provider-named block such as `fly`; legacy top-level Fly fields are still accepted for old configs.
 
 The checked-in `rove.json` in this repo is a working repo-local config for development. Treat `rove.example.json` as the public template.
+
+## Vast.ai Example Config
+
+Install and authenticate the Vast.ai CLI first:
+
+```bash
+pip install vastai
+vastai set api-key <your-api-key>
+```
+
+Then add a GPU target:
+
+```json
+{
+  "targets": [
+    {
+      "name": "gpu-4090",
+      "provider": "vast",
+      "ssh_user": "root",
+      "startup_script": "./scripts/bootstrap-gpu.sh",
+      "vast": {
+        "query": "gpu_name=RTX_4090 num_gpus=1 verified=true direct_port_count>=1 rentable=true",
+        "image": "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime",
+        "disk_gb": 80,
+        "order": "dlperf_usd-"
+      }
+    }
+  ]
+}
+```
+
+Rove searches offers with the query, rents the first result, launches it as an SSH/direct instance, attaches Rove's managed SSH key, records the returned `ssh_host` and `ssh_port`, then runs the normal SSH/bootstrap flow.
+
+Use `offer_id` instead of `query` when you want to rent a specific offer:
+
+```json
+{
+  "name": "gpu-fixed",
+  "provider": "vast",
+  "ssh_user": "root",
+  "vast": {
+    "offer_id": 9001,
+    "image": "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime",
+    "disk_gb": 80
+  }
+}
+```
 
 ## Command Overview
 
@@ -202,7 +249,7 @@ rove adopt devbox <machine-id> --name recovered
 ```
 
 `doctor` checks:
-- Fly CLI presence and auth
+- configured provider CLI presence and auth
 - config loading
 - pinned image refs
 - managed SSH keys

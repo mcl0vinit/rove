@@ -21,6 +21,7 @@ fakebin="${tmpdir}/bin"
 workdir="${tmpdir}/work"
 home="${tmpdir}/home"
 machines_json="${tmpdir}/machines.json"
+vast_machines_json="${tmpdir}/vast-machines.json"
 mkdir -p "${fakebin}" "${workdir}" "${home}"
 
 cat > "${machines_json}" <<'EOF'
@@ -32,6 +33,10 @@ cat > "${machines_json}" <<'EOF'
     "region": "iad"
   }
 ]
+EOF
+
+cat > "${vast_machines_json}" <<'EOF'
+[]
 EOF
 
 cat > "${fakebin}/flyctl" <<'EOF'
@@ -85,6 +90,90 @@ printf 'unexpected flyctl args: %s\n' "$*" >&2
 exit 1
 EOF
 
+cat > "${fakebin}/vastai" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+vast_machines_json="${TMP_FAKE_STATE_DIR:?}/vast-machines.json"
+
+if [[ "${1:-}" == "--help" ]]; then
+  echo 'vastai smoke help'
+  exit 0
+fi
+
+if [[ "${1:-}" == "show" && "${2:-}" == "user" ]]; then
+  echo '{"id": 1, "balance": 10}'
+  exit 0
+fi
+
+if [[ "${1:-}" == "search" && "${2:-}" == "offers" ]]; then
+  cat <<'JSON'
+[
+  {
+    "id": 9001,
+    "gpu_name": "RTX 4090",
+    "num_gpus": 1,
+    "dph": 0.42,
+    "rentable": true
+  }
+]
+JSON
+  exit 0
+fi
+
+if [[ "${1:-}" == "create" && "${2:-}" == "instance" ]]; then
+  offer_id="${3:-}"
+  label="rove-gpu-smoke"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --label)
+        label="$2"
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  id="7001"
+  jq \
+    --arg id "${id}" \
+    --arg label "${label}" \
+    --arg offer_id "${offer_id}" \
+    '. += [{id: ($id | tonumber), label: $label, offer_id: ($offer_id | tonumber), actual_status: "running", cur_state: "running", ssh_host: "ssh.fake.vast.ai", ssh_port: 32022, geolocation: "US", gpu_name: "RTX 4090", num_gpus: 1}]' \
+    "${vast_machines_json}" > "${vast_machines_json}.tmp"
+  mv "${vast_machines_json}.tmp" "${vast_machines_json}"
+  echo '{"success": true, "new_contract": 7001}'
+  exit 0
+fi
+
+if [[ "${1:-}" == "attach" && "${2:-}" == "ssh" ]]; then
+  echo '{"success": true}'
+  exit 0
+fi
+
+if [[ "${1:-}" == "show" && "${2:-}" == "instance" ]]; then
+  instance_id="${3:-}"
+  if ! jq -e --argjson id "${instance_id}" '.[] | select(.id == $id)' "${vast_machines_json}" >/dev/null; then
+    echo 'instance not found' >&2
+    exit 1
+  fi
+  jq --argjson id "${instance_id}" '{"instances": (.[] | select(.id == $id))}' "${vast_machines_json}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "destroy" && "${2:-}" == "instance" ]]; then
+  instance_id="${3:-}"
+  jq --argjson id "${instance_id}" 'map(select(.id != $id))' "${vast_machines_json}" > "${vast_machines_json}.tmp"
+  mv "${vast_machines_json}.tmp" "${vast_machines_json}"
+  echo '{"success": true}'
+  exit 0
+fi
+
+printf 'unexpected vastai args: %s\n' "$*" >&2
+exit 1
+EOF
+
 cat > "${fakebin}/ssh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -110,7 +199,7 @@ cat > "${fakebin}/scp" <<'EOF'
 exit 0
 EOF
 
-chmod +x "${fakebin}/flyctl" "${fakebin}/ssh" "${fakebin}/scp"
+chmod +x "${fakebin}/flyctl" "${fakebin}/vastai" "${fakebin}/ssh" "${fakebin}/scp"
 
 cat > "${workdir}/rove.json" <<EOF
 {
@@ -124,6 +213,17 @@ cat > "${workdir}/rove.json" <<EOF
         "app": "fake-devbox",
         "image": "registry.fly.io/fake-devbox:latest@sha256:smoke",
         "vm_size": "shared-cpu-2x"
+      }
+    },
+    {
+      "name": "gpu",
+      "provider": "vast",
+      "ssh_user": "root",
+      "vast": {
+        "query": "gpu_name=RTX_4090 num_gpus=1 verified=true direct_port_count>=1 rentable=true",
+        "image": "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime",
+        "disk_gb": 80,
+        "order": "dlperf_usd-"
       }
     }
   ]
@@ -182,6 +282,14 @@ assert_json "${inspect_json}" '.machine.name == "smoke" and .machine.target_name
 
 run_rove exec smoke -- true >/dev/null
 
+gpu_up_json="$(run_rove up gpu --name gpu-smoke --json)"
+assert_json "${gpu_up_json}" '.machine.name == "gpu-smoke" and .machine.provider == "vast" and .machine.host == "ssh.fake.vast.ai" and .machine.ssh_port == 32022 and .machine.ssh_user == "root" and .machine.status == "ready"'
+
+gpu_inspect_json="$(run_rove inspect gpu-smoke --json)"
+assert_json "${gpu_inspect_json}" '.machine.name == "gpu-smoke" and .machine.provider == "vast" and .machine.remote_state == "running" and .machine.ssh_port == 32022'
+
+run_rove exec gpu-smoke -- true >/dev/null
+
 touch "${tmpdir}/hostkey-once"
 doctor_output="$(run_rove doctor smoke)"
 assert_contains "${doctor_output}" $'ssh\tok\tsmoke: SSH is reachable'
@@ -194,6 +302,9 @@ assert_contains "${prune_output}" $'adopted\tpruned\tprovisioned_unreachable\tmi
 
 down_json="$(run_rove down smoke --json)"
 assert_json "${down_json}" '.destroyed == true and .machine.name == "smoke"'
+
+gpu_down_json="$(run_rove down gpu-smoke --json)"
+assert_json "${gpu_down_json}" '.destroyed == true and .machine.name == "gpu-smoke" and .machine.provider == "vast"'
 
 state_json="${home}/.rove/state.json"
 if [[ ! -f "${state_json}" ]]; then

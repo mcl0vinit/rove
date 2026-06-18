@@ -2,9 +2,11 @@ const std = @import("std");
 const config = @import("../config.zig");
 const model = @import("../model.zig");
 const fly = @import("fly.zig");
+const vast = @import("vast.zig");
 
 pub const ProviderTargetConfig = union(model.ProviderKind) {
     fly: model.FlyTargetConfig,
+    vast: model.VastTargetConfig,
 };
 
 pub const CreateRequest = struct {
@@ -72,6 +74,8 @@ pub const TargetSummary = struct {
 
 const fly_version_args = [_][]const u8{ "flyctl", "version" };
 const fly_auth_args = [_][]const u8{ "flyctl", "auth", "whoami" };
+const vast_help_args = [_][]const u8{ "vastai", "--help" };
+const vast_auth_args = [_][]const u8{ "vastai", "show", "user" };
 const fly_doctor_checks = [_]DoctorCheck{
     .{
         .name = "flyctl",
@@ -84,6 +88,18 @@ const fly_doctor_checks = [_]DoctorCheck{
         .ok_detail = "Fly auth is configured",
     },
 };
+const vast_doctor_checks = [_]DoctorCheck{
+    .{
+        .name = "vastai",
+        .argv = &vast_help_args,
+        .ok_detail = "vastai is available",
+    },
+    .{
+        .name = "vast auth",
+        .argv = &vast_auth_args,
+        .ok_detail = "Vast.ai auth is configured",
+    },
+};
 
 pub fn create(
     allocator: std.mem.Allocator,
@@ -92,12 +108,14 @@ pub fn create(
 ) !CreateResult {
     return switch (provider) {
         .fly => fly.create(allocator, request),
+        .vast => vast.create(allocator, request),
     };
 }
 
 pub fn doctorChecks(provider: model.ProviderKind) []const DoctorCheck {
     return switch (provider) {
         .fly => &fly_doctor_checks,
+        .vast => &vast_doctor_checks,
     };
 }
 
@@ -113,18 +131,30 @@ pub fn targetSummary(target: model.TargetConfig) TargetSummary {
                 .size = fly_config.vm_size,
             };
         },
+        .vast => blk: {
+            const vast_config = config.resolveVastTarget(target);
+            break :blk .{
+                .scope_label = if (vast_config.offer_id == null) "query" else "offer",
+                .scope = if (vast_config.offer_id == null) vast_config.query else "fixed",
+                .image = vast_config.image,
+                .size_label = "selection",
+                .size = if (vast_config.offer_id == null) "marketplace" else "fixed offer",
+            };
+        },
     };
 }
 
 pub fn scopeForConfig(provider_config: ProviderTargetConfig) ?[]const u8 {
     return switch (provider_config) {
         .fly => |fly_config| fly_config.app,
+        .vast => null,
     };
 }
 
 pub fn legacyAppAliasForConfig(provider_config: ProviderTargetConfig) ?[]const u8 {
     return switch (provider_config) {
         .fly => |fly_config| fly_config.app,
+        .vast => null,
     };
 }
 
@@ -134,6 +164,7 @@ pub fn fallbackHost(
 ) !?[]u8 {
     return switch (provider_config) {
         .fly => |fly_config| try std.fmt.allocPrint(allocator, "{s}.fly.dev", .{fly_config.app}),
+        .vast => null,
     };
 }
 
@@ -154,6 +185,11 @@ pub fn renderPlacementSummary(
                 return std.fmt.allocPrint(allocator, "flexible preference {s}", .{joined});
             }
         },
+        .vast => {
+            const vast_config = config.resolveVastTarget(target);
+            if (vast_config.offer_id) |_| return allocator.dupe(u8, "fixed offer");
+            return allocator.dupe(u8, "marketplace search");
+        },
     }
 
     return allocator.dupe(u8, "provider-selected placement");
@@ -166,6 +202,7 @@ pub fn destroy(
 ) !void {
     switch (provider) {
         .fly => try fly.destroy(allocator, request),
+        .vast => try vast.destroy(allocator, request),
     }
 }
 
@@ -176,5 +213,6 @@ pub fn inspect(
 ) !InspectResult {
     return switch (provider) {
         .fly => fly.inspect(allocator, request),
+        .vast => vast.inspect(allocator, request),
     };
 }

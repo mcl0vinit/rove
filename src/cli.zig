@@ -1525,6 +1525,7 @@ fn isPinnedImageRef(image: []const u8) bool {
 fn providerConfigForTarget(target: model.TargetConfig) provider.ProviderTargetConfig {
     return switch (target.provider) {
         .fly => .{ .fly = config.resolveFlyTarget(target) },
+        .vast => .{ .vast = config.resolveVastTarget(target) },
     };
 }
 
@@ -1533,6 +1534,7 @@ fn providerConfigForMachine(machine: model.MachineRecord) !provider.ProviderTarg
         .fly => .{ .fly = .{
             .app = machine.provider_scope orelse machine.app orelse return error.MissingProviderScope,
         } },
+        .vast => .{ .vast = .{} },
     };
 }
 
@@ -1542,19 +1544,29 @@ fn lifecycleFromRemoteState(
 ) model.LifecycleStatus {
     const value = remote_state orelse return fallback;
 
-    if (std.ascii.eqlIgnoreCase(value, "started") or std.ascii.eqlIgnoreCase(value, "running")) {
+    if (std.ascii.eqlIgnoreCase(value, "started") or
+        std.ascii.eqlIgnoreCase(value, "running") or
+        std.ascii.eqlIgnoreCase(value, "frozen"))
+    {
         return .ready;
     }
 
     if (std.ascii.eqlIgnoreCase(value, "created") or
         std.ascii.eqlIgnoreCase(value, "starting") or
-        std.ascii.eqlIgnoreCase(value, "pending"))
+        std.ascii.eqlIgnoreCase(value, "pending") or
+        std.ascii.eqlIgnoreCase(value, "loading") or
+        std.ascii.eqlIgnoreCase(value, "rebooting"))
     {
         return .provisioned;
     }
 
     if (std.ascii.eqlIgnoreCase(value, "stopped") or
         std.ascii.eqlIgnoreCase(value, "suspended") or
+        std.ascii.eqlIgnoreCase(value, "exited") or
+        std.ascii.eqlIgnoreCase(value, "offline") or
+        std.ascii.eqlIgnoreCase(value, "unknown") or
+        std.ascii.eqlIgnoreCase(value, "unloaded") or
+        std.ascii.eqlIgnoreCase(value, "terminated") or
         std.ascii.eqlIgnoreCase(value, "failed") or
         std.ascii.eqlIgnoreCase(value, "destroyed") or
         std.ascii.eqlIgnoreCase(value, "missing"))

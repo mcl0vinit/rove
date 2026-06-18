@@ -11,6 +11,7 @@ pub const Error = std.fs.File.OpenError ||
         EmptyTargetName,
         MissingApp,
         MissingImage,
+        MissingVastQuery,
         MissingVmSize,
         MissingSshUser,
         MissingRegionPreference,
@@ -81,6 +82,10 @@ pub fn resolveFlyTarget(target: model.TargetConfig) model.FlyTargetConfig {
     };
 }
 
+pub fn resolveVastTarget(target: model.TargetConfig) model.VastTargetConfig {
+    return target.vast orelse .{};
+}
+
 fn validate(
     targets: []const model.TargetConfig,
     options: ValidationOptions,
@@ -98,6 +103,11 @@ fn validate(
                 if (fly.region_preference) |preference| {
                     if (preference.len == 0) return error.MissingRegionPreference;
                 }
+            },
+            .vast => {
+                const vast = resolveVastTarget(target);
+                if (vast.offer_id == null and vast.query.len == 0) return error.MissingVastQuery;
+                if (vast.image.len == 0 and vast.template_hash == null) return error.MissingImage;
             },
         }
 
@@ -174,6 +184,39 @@ test "parse legacy top-level fly config" {
     const target = try resolveTarget(&parsed.value, "devbox");
     const fly = resolveFlyTarget(target.*);
     try std.testing.expectEqualStrings("devbox", fly.app);
+}
+
+test "parse and resolve vast target config" {
+    const allocator = std.testing.allocator;
+    const contents =
+        \\{
+        \\  "targets": [
+        \\    {
+        \\      "name": "gpu",
+        \\      "provider": "vast",
+        \\      "ssh_user": "root",
+        \\      "vast": {
+        \\        "query": "gpu_name=RTX_4090 num_gpus=1 verified=true direct_port_count>=1 rentable=true",
+        \\        "image": "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime",
+        \\        "disk_gb": 80,
+        \\        "order": "dlperf_usd-"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var parsed = try parseSlice(allocator, contents, ValidationOptions{
+        .check_startup_script_paths = false,
+    });
+    defer parsed.deinit();
+
+    const target = try resolveTarget(&parsed.value, "gpu");
+    try std.testing.expectEqual(model.ProviderKind.vast, target.provider);
+
+    const vast = resolveVastTarget(target.*);
+    try std.testing.expectEqualStrings("pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime", vast.image);
+    try std.testing.expectEqual(@as(u32, 80), vast.disk_gb);
 }
 
 test "reject duplicate target names" {
