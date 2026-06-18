@@ -1,40 +1,63 @@
 # Rove
 
-Rove provisions and tracks disposable remote machines.
+Rove is a personal CLI for launching, tracking, reaching, and destroying disposable remote machines through provider backends.
 
-Rove owns machine lifecycle, SSH reachability, bootstrap, provider reconciliation, and teardown. It deliberately does not own workspace sync, terminal session state, distributed search, or higher-level control-plane UX.
-
-The current V1 is narrow on purpose:
-- Fly Machines for CPU devboxes
-- Vast.ai instances for GPU workloads
-- pinned image refs
-- local JSON state in `~/.rove/state.json`
-- managed SSH keys and isolated known hosts
-- optional target bootstrap script
-
-## Core Workflow
+The important part is the stable interface:
 
 ```bash
-rove up devbox --name work
-rove status work
-rove inspect work --json
-rove ssh work
-rove exec work -- uname -a
-rove down work
+rove up <target> --name <name>
+rove inspect <name> --json
+rove ssh <name>
+rove exec <name> -- <command>
+rove down <name>
 ```
 
-`rove run` remains an alias for `rove up`.
+The provider can be Fly, Vast.ai, or a future backend. Rove keeps the same lifecycle and SSH experience while provider-specific details stay in `rove.json`.
+
+## What Rove Owns
+
+Rove owns:
+- machine lifecycle: create, inspect, refresh, adopt, destroy
+- SSH reachability: managed keys, isolated known hosts, `ssh`, `exec`, file upload for bootstrap
+- optional bootstrap scripts after SSH becomes reachable
+- local machine state in `~/.rove/state.json`
+- provider reconciliation through `rove refresh` and `rove doctor`
+- script-friendly JSON output
+
+Rove does not own:
+- terminal session state
+- tmux layout, bindings, capture, or orchestration
+- repo, pane, port, or process indexing
+- distributed search
+- workspace sync or pull flows
+- public UI or cockpit behavior
+
+Higher-level tools should treat Rove as the machine backend: create or adopt a machine, inspect the normalized machine record, then decide what to do with it.
+
+## Providers
+
+Current providers:
+- `fly`: Fly Machines for CPU devboxes
+- `vast`: Vast.ai instances for GPU workloads
+
+Provider-specific CLIs are called directly. Rove does not reimplement each provider API yet.
+
+Provider prerequisites:
+- Fly targets require `flyctl` and Fly auth.
+- Vast targets require `vastai` and a configured Vast.ai API key.
+
+`rove doctor` checks only the providers present in your config.
 
 ## Install
 
-Install from GitHub with Nix:
+Install Rove with Nix:
 
 ```bash
 nix profile add github:mcl0vinit/rove
 rove help
 ```
 
-If you are working from a checkout:
+From a checkout:
 
 ```bash
 nix develop
@@ -43,19 +66,16 @@ nix develop -c zig build test
 
 ## Core Concepts
 
-- `target`: a named machine definition in `rove.json`
-- `name`: a tracked machine instance name such as `work` or `gpu-east`
-- `provider`: the machine backend; currently `fly` and `vast`
+- `target`: a named machine definition in `rove.json`, such as `devbox` or `gpu-4090`
+- `name`: a tracked machine instance name, such as `work`, `train`, or `gpu-east`
+- `provider`: the backend used by a target
+- `machine record`: the normalized state Rove stores locally and prints as JSON
+
+Targets are reusable definitions. Names are individual machine instances created from those targets.
 
 ## Quick Start
 
-1. Set up a Fly app and publish the base image from [`infra/fly/devbox/`](infra/fly/devbox/README.md).
-2. Copy [`rove.example.json`](rove.example.json) to `rove.json`.
-3. Replace the example `app` and `image` values with your own Fly app and pinned image digest.
-4. Run `rove doctor` to verify local prerequisites.
-5. Start a machine.
-
-Example:
+Copy the example config and edit the provider settings:
 
 ```bash
 cp rove.example.json rove.json
@@ -64,78 +84,9 @@ rove up devbox --name work
 rove ssh work
 ```
 
-## Fly Example Config
+The checked-in `rove.json` is a repo-local development config. Treat `rove.example.json` as the public template.
 
-```json
-{
-  "targets": [
-    {
-      "name": "devbox",
-      "provider": "fly",
-      "ssh_user": "rove",
-      "startup_script": "./scripts/bootstrap.sh",
-      "fly": {
-        "app": "your-fly-app",
-        "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
-        "vm_size": "shared-cpu-2x"
-      }
-    }
-  ]
-}
-```
-
-`startup_script` is optional. If present, Rove uploads and runs it after SSH becomes reachable. Provider settings live under a provider-named block such as `fly`; legacy top-level Fly fields are still accepted for old configs.
-
-The checked-in `rove.json` in this repo is a working repo-local config for development. Treat `rove.example.json` as the public template.
-
-## Vast.ai Example Config
-
-Install and authenticate the Vast.ai CLI first:
-
-```bash
-pip install vastai
-vastai set api-key <your-api-key>
-```
-
-Then add a GPU target:
-
-```json
-{
-  "targets": [
-    {
-      "name": "gpu-4090",
-      "provider": "vast",
-      "ssh_user": "root",
-      "startup_script": "./scripts/bootstrap-gpu.sh",
-      "vast": {
-        "query": "gpu_name=RTX_4090 num_gpus=1 verified=true direct_port_count>=1 rentable=true",
-        "image": "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime",
-        "disk_gb": 80,
-        "order": "dlperf_usd-"
-      }
-    }
-  ]
-}
-```
-
-Rove searches offers with the query, rents the first result, launches it as an SSH/direct instance, attaches Rove's managed SSH key, records the returned `ssh_host` and `ssh_port`, then runs the normal SSH/bootstrap flow.
-
-Use `offer_id` instead of `query` when you want to rent a specific offer:
-
-```json
-{
-  "name": "gpu-fixed",
-  "provider": "vast",
-  "ssh_user": "root",
-  "vast": {
-    "offer_id": 9001,
-    "image": "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime",
-    "disk_gb": 80
-  }
-}
-```
-
-## Command Overview
+## Commands
 
 ```bash
 rove up <target> [--name <name>] [--json]
@@ -151,9 +102,130 @@ rove exec <name> -- <command> [args...]
 rove down <name> [--json]
 ```
 
+`rove run` is an alias for `rove up`.
+
+## Fly Targets
+
+Fly targets are useful for CPU devboxes and long-lived base images.
+
+First build and publish the image from [`infra/fly/devbox/`](infra/fly/devbox/README.md), then pin the resulting image digest:
+
+```bash
+./scripts/pin-image-ref.sh devbox 'registry.fly.io/your-fly-app:latest@sha256:<digest>'
+```
+
+Example target:
+
+```json
+{
+  "name": "devbox",
+  "provider": "fly",
+  "ssh_user": "rove",
+  "startup_script": "./scripts/bootstrap.sh",
+  "fly": {
+    "app": "your-fly-app",
+    "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
+    "vm_size": "shared-cpu-2x",
+    "region": "iad"
+  }
+}
+```
+
+Fly fields:
+- `app`: Fly app name
+- `image`: image ref to run, preferably pinned by digest
+- `vm_size`: Fly machine size
+- `region`: optional fixed region
+- `region_preference`: optional ordered list of preferred regions
+
+Legacy top-level Fly fields are still accepted for older configs, but new configs should use the nested `fly` block.
+
+## Vast.ai Targets
+
+Vast targets are useful for short-lived GPU machines. Rove searches offers, rents an instance, requests direct SSH, attaches Rove's managed SSH public key, records the returned `ssh_host` and `ssh_port`, then uses the normal Rove SSH/bootstrap flow.
+
+Install and authenticate the Vast CLI:
+
+```bash
+pip install vastai
+vastai set api-key <your-api-key>
+```
+
+Example target using marketplace search:
+
+```json
+{
+  "name": "gpu-4090",
+  "provider": "vast",
+  "ssh_user": "root",
+  "startup_script": "./scripts/bootstrap-gpu.sh",
+  "vast": {
+    "query": "gpu_name=RTX_4090 num_gpus=1 verified=true direct_port_count>=1 rentable=true",
+    "image": "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime",
+    "disk_gb": 80,
+    "order": "dlperf_usd-"
+  }
+}
+```
+
+Example target using a specific offer:
+
+```json
+{
+  "name": "gpu-fixed",
+  "provider": "vast",
+  "ssh_user": "root",
+  "vast": {
+    "offer_id": 9001,
+    "image": "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime",
+    "disk_gb": 80
+  }
+}
+```
+
+Vast fields:
+- `query`: Vast offer query; required unless `offer_id` is set
+- `offer_id`: specific offer to rent; skips search
+- `image`: Docker image; required unless `template_hash` is set
+- `template_hash`: Vast template hash; alternative to `image`
+- `disk_gb`: disk size in GB, default `40`
+- `order`: offer ordering, default `dlperf_usd-`
+- `search_type`: Vast search type, default `on-demand`
+- `direct`: request direct SSH, default `true`
+- `cancel_unavail`: cancel unavailable offers, default `true`
+- `bid_price`: optional interruptible bid price
+- `env`: optional Vast env string
+- `onstart_cmd`: optional Vast on-start command
+
 ## Script Contract
 
-Rove's script-facing API is JSON on stdout and errors/warnings on stderr. The normalized SSH endpoint is `ssh_user`, `host`, and `ssh_port`; provider-specific details can live in `provider_metadata`.
+Rove's script-facing API is JSON on stdout and errors or warnings on stderr.
+
+The stable normalized SSH endpoint is:
+- `ssh_user`
+- `host`
+- `ssh_port`
+
+Common machine fields:
+
+```json
+{
+  "name": "train",
+  "target_name": "gpu-4090",
+  "provider": "vast",
+  "id": "7001",
+  "machine_name": "rove-train",
+  "provider_scope": null,
+  "app": null,
+  "host": "ssh5.vast.ai",
+  "ssh_port": 32022,
+  "region": "US",
+  "remote_state": "running",
+  "ssh_user": "root",
+  "status": "ready",
+  "provider_metadata": null
+}
+```
 
 Machine-list commands return:
 
@@ -205,21 +277,6 @@ Single-machine commands return:
 
 Prefer `rove inspect <name> --json` for scripts and higher-level automation.
 
-## Security Model
-
-Rove is designed for personal remote machine provisioning, not as a hardened bastion host.
-
-Current defaults:
-- SSH is key-only
-- root login is disabled in the provided devbox image
-- SSH agent forwarding is disabled
-- TCP, stream-local, and tunnel forwarding are disabled
-- plain authorized keys are rewritten to `restrict,pty` in the provided devbox image
-- SSH known-host entries are isolated under `~/.rove/known_hosts`
-
-Important limitation:
-- if someone gets shell access to the box, anything you intentionally put there is exposed
-
 ## Recovery
 
 Refresh local state from the provider:
@@ -229,7 +286,7 @@ rove refresh
 rove refresh work
 ```
 
-Prune machines that were deleted outside Rove:
+Prune machines deleted outside Rove:
 
 ```bash
 rove refresh --prune-missing
@@ -246,38 +303,31 @@ Adopt an existing machine:
 
 ```bash
 rove adopt devbox <machine-id> --name recovered
+rove adopt gpu-4090 <vast-instance-id> --name recovered-gpu
 ```
 
 `doctor` checks:
 - configured provider CLI presence and auth
 - config loading
-- pinned image refs
+- image digest pinning where the target has an image field
 - managed SSH keys
 - tracked machine reachability
 - stale SSH host keys, with automatic cleanup and retry
 
-## Boundaries
+## Security Model
 
-Rove should stay the provider-backed machine launcher.
+Rove is designed for personal remote machine provisioning, not as a hardened bastion host.
 
-Rove should not own:
-- terminal session control
-- repo, port, or pane indexing
-- distributed grep/search
-- workspace sync or pull flows
-- public UI or cockpit behavior
+Current defaults:
+- SSH is key-only.
+- SSH agent forwarding is disabled by Rove's client invocation.
+- TCP, stream-local, and tunnel forwarding are disabled by Rove's client invocation.
+- SSH known-host entries are isolated under `~/.rove/known_hosts`.
+- Fly's provided devbox image disables root login and rewrites authorized keys to `restrict,pty`.
+- Vast instances run whatever image/template you choose; validate image defaults yourself.
 
-Higher-level tools should treat Rove as a backend: create or adopt a machine, inspect its machine record, then decide what to do with it.
-
-## Building The Devbox Image
-
-The Fly image scaffold lives in [`infra/fly/devbox/`](infra/fly/devbox/README.md).
-
-After publishing a new image, pin its digest into your config:
-
-```bash
-./scripts/pin-image-ref.sh devbox 'registry.fly.io/your-fly-app:latest@sha256:<digest>'
-```
+Important limitation:
+- if someone gets shell access to a machine, anything you intentionally put there is exposed
 
 ## Development
 
@@ -293,4 +343,10 @@ Run the fake-provider smoke test directly:
 ```bash
 nix develop -c zig build
 ./scripts/integration-smoke.sh
+```
+
+Build the CLI:
+
+```bash
+nix develop -c zig build --summary all
 ```
