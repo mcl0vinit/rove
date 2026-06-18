@@ -5,7 +5,7 @@ ENV NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 ARG DOTFILES_REPO=https://github.com/mcl0vinit/dotfiles.git
-ARG DOTFILES_REF=ad9fd4d4429b8bc08d9cf0a6dfa69aa79ecc6be5
+ARG DOTFILES_REF=7e9846ad2bc625c648b712d7cc3415732b4a7d26
 
 SHELL ["/bin/bash", "-lc"]
 

@@ -108,7 +108,13 @@ You can still use plain deploy for image iteration:
 fly deploy
 ```
 
-The image is pinned to a specific dotfiles commit in `Dockerfile` via `DOTFILES_REF`. When you want a newer baseline baked in, update that ref and rebuild the image.
+The image is pinned to a specific dotfiles commit in `Dockerfile` via `DOTFILES_REF`. The current baked baseline is:
+
+```text
+7e9846ad2bc625c648b712d7cc3415732b4a7d26
+```
+
+When you want a newer baseline baked in, update that ref and rebuild the image. If your Rove target also runs `../dotfiles/bin/bootstrap-remote`, the runtime bootstrap can re-apply the latest dotfiles `main` after SSH is ready.
 
 Rove target configs should also pin the resulting image ref by digest. The repo helper for that is:
 
@@ -158,7 +164,7 @@ The default `devbox` target assumes the common terminal tooling is already in th
   "name": "devbox",
   "provider": "fly",
   "ssh_user": "rove",
-  "startup_script": "./scripts/bootstrap.sh",
+  "startup_script": "../dotfiles/bin/bootstrap-remote",
   "fly": {
     "app": "your-fly-app",
     "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",

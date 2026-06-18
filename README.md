@@ -86,6 +86,12 @@ rove ssh work
 
 The checked-in `rove.json` is a repo-local development config. Treat `rove.example.json` as the public template.
 
+For personal machines, point `startup_script` at your dotfiles remote bootstrap. In this checkout layout that is:
+
+```json
+"startup_script": "../dotfiles/bin/bootstrap-remote"
+```
+
 ## Commands
 
 ```bash
@@ -121,7 +127,7 @@ Example target:
   "name": "devbox",
   "provider": "fly",
   "ssh_user": "rove",
-  "startup_script": "./scripts/bootstrap.sh",
+  "startup_script": "../dotfiles/bin/bootstrap-remote",
   "fly": {
     "app": "your-fly-app",
     "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
@@ -158,7 +164,7 @@ Example target using marketplace search:
   "name": "gpu-4090",
   "provider": "vast",
   "ssh_user": "root",
-  "startup_script": "./scripts/bootstrap-gpu.sh",
+  "startup_script": "../dotfiles/bin/bootstrap-remote",
   "vast": {
     "query": "gpu_name=RTX_4090 num_gpus=1 verified=true direct_port_count>=1 rentable=true",
     "image": "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime",
