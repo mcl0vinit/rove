@@ -258,7 +258,7 @@ fn wrappedRemoteCommand(
     const quoted = try shell.quote(allocator, remote_command);
     defer allocator.free(quoted);
 
-    return std.fmt.allocPrint(allocator, "/bin/bash -lc {s}", .{quoted});
+    return std.fmt.allocPrint(allocator, "/bin/bash -c {s}", .{quoted});
 }
 
 fn appendOpenSshOptions(
@@ -347,4 +347,27 @@ test "detect stale host key failures" {
     try std.testing.expect(isHostKeyMismatch("Host key verification failed.\n"));
     try std.testing.expect(isHostKeyMismatch("Offending ED25519 key in /tmp/known_hosts:1\n"));
     try std.testing.expect(!isHostKeyMismatch("Permission denied (publickey).\n"));
+}
+
+test "wrapped remote command uses non-login shell" {
+    const allocator = std.testing.allocator;
+    const wrapped = try wrappedRemoteCommand(allocator, "true");
+    defer allocator.free(wrapped);
+
+    try std.testing.expectEqualStrings("/bin/bash -c 'true'", wrapped);
+    try std.testing.expect(std.mem.indexOf(u8, wrapped, " -lc ") == null);
+}
+
+test "wrapped remote command preserves shell quoting" {
+    const allocator = std.testing.allocator;
+    const remote_command = "printf \"%s\" \"a'b\"";
+    const quoted = try shell.quote(allocator, remote_command);
+    defer allocator.free(quoted);
+    const expected = try std.fmt.allocPrint(allocator, "/bin/bash -c {s}", .{quoted});
+    defer allocator.free(expected);
+
+    const wrapped = try wrappedRemoteCommand(allocator, remote_command);
+    defer allocator.free(wrapped);
+
+    try std.testing.expectEqualStrings(expected, wrapped);
 }
