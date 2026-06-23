@@ -59,3 +59,22 @@ pub fn defaultLocalGhHostsPath(allocator: std.mem.Allocator) ![]u8 {
 
     return std.fmt.allocPrint(allocator, "{s}/.config/gh/hosts.yml", .{home});
 }
+
+pub fn expandUserPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (path.len == 0 or path[0] != '~') {
+        return allocator.dupe(u8, path);
+    }
+
+    if (path.len > 1 and path[1] != '/') {
+        return allocator.dupe(u8, path);
+    }
+
+    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home);
+
+    if (path.len == 1) {
+        return allocator.dupe(u8, home);
+    }
+
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ home, path[1..] });
+}

@@ -1,8 +1,0 @@
-*
-!Dockerfile
-!README.md
-!entrypoint.sh
-!flake.lock
-!flake.nix
-!fly.toml
-!sshd_config

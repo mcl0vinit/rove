@@ -403,6 +403,8 @@ fn appendMachineJson(
     try appendJsonString(out, machine.host);
     try out.writer.writeAll(",\"ssh_port\":");
     try std.json.Stringify.value(machine.ssh_port, .{}, &out.writer);
+    try out.writer.writeAll(",\"ssh_identity_file\":");
+    try appendJsonNullableString(out, machine.ssh_identity_file);
     try out.writer.writeAll(",\"region\":");
     try appendJsonNullableString(out, machine.region);
     try out.writer.writeAll(",\"remote_state\":");
@@ -825,6 +827,7 @@ fn handleAdopt(
     const inspected = try provider.inspect(allocator, target.provider, .{
         .provider_config = target_provider_config,
         .machine_id = command.machine_id,
+        .instance_name = command.name,
     });
     defer inspected.deinit(allocator);
 
@@ -884,6 +887,7 @@ fn handleAdopt(
         .app = provider.legacyAppAliasForConfig(target_provider_config),
         .host = adopted_host,
         .ssh_port = inspected.ssh_port orelse 22,
+        .ssh_identity_file = target.ssh_identity_file,
         .region = inspected.region,
         .remote_state = inspected.remote_state,
         .ssh_user = target.ssh_user,
@@ -982,10 +986,19 @@ fn handleRun(
     const placement = try provider.renderPlacementSummary(allocator, target.*);
     defer allocator.free(placement);
 
+    var create_authorized_key: ?[]u8 = null;
+    defer if (create_authorized_key) |authorized_key| allocator.free(authorized_key);
+    if (target.ssh_identity_file) |ssh_identity_file| {
+        const expanded_identity_file = try paths.expandUserPath(allocator, ssh_identity_file);
+        defer allocator.free(expanded_identity_file);
+        create_authorized_key = try keys.publicKeyForPrivateKey(allocator, expanded_identity_file);
+    }
+
     const created = provider.create(allocator, target.provider, .{
         .target_name = target.name,
         .provider_config = target_provider_config,
         .instance_name = instance_name,
+        .authorized_key = create_authorized_key,
     }) catch |err| {
         try std.fmt.format(
             stderr,
@@ -1006,6 +1019,7 @@ fn handleRun(
         .app = provider.legacyAppAliasForConfig(target_provider_config),
         .host = created.host,
         .ssh_port = created.ssh_port,
+        .ssh_identity_file = target.ssh_identity_file,
         .region = created.region,
         .ssh_user = target.ssh_user,
         .status = .provisioned,
@@ -1327,6 +1341,7 @@ fn refreshMachineFromProvider(
     const inspected = try provider.inspect(allocator, machine.provider, .{
         .provider_config = machine_provider_config,
         .machine_id = machine.id,
+        .instance_name = machine.name,
     });
 
     if (!inspected.exists) {
@@ -1533,6 +1548,8 @@ fn providerConfigForMachine(machine: model.MachineRecord) !provider.ProviderTarg
     return switch (machine.provider) {
         .fly => .{ .fly = .{
             .app = machine.provider_scope orelse machine.app orelse return error.MissingProviderScope,
+            .ssh_host = machine.host,
+            .ssh_port = machine.ssh_port,
         } },
         .vast => .{ .vast = .{} },
     };
