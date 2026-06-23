@@ -60,6 +60,36 @@ pub fn ensureGitAuthKeyPair(allocator: std.mem.Allocator) !ManagedKeyPair {
     };
 }
 
+pub fn publicKeyForPrivateKey(
+    allocator: std.mem.Allocator,
+    private_key_path: []const u8,
+) ![]u8 {
+    const public_key_path = try std.fmt.allocPrint(allocator, "{s}.pub", .{private_key_path});
+    defer allocator.free(public_key_path);
+
+    if (fileExists(public_key_path)) {
+        return readTrimmedFile(allocator, public_key_path);
+    }
+
+    const result = try exec.run(allocator, &.{
+        "ssh-keygen",
+        "-q",
+        "-y",
+        "-f",
+        private_key_path,
+    });
+    defer result.deinit(allocator);
+
+    if (!result.succeeded()) {
+        if (result.stderr.len > 0) {
+            std.debug.print("[error] failed to derive SSH public key\n{s}", .{result.stderr});
+        }
+        return error.CommandFailed;
+    }
+
+    return allocator.dupe(u8, std.mem.trimRight(u8, result.stdout, "\r\n"));
+}
+
 fn ensureKeyMaterial(
     allocator: std.mem.Allocator,
     private_key_path: []const u8,

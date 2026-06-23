@@ -228,7 +228,10 @@ fn prepareConnection(
     });
     errdefer allocator.free(port_option);
 
-    const identity_file = try paths.defaultManagedPrivateKeyPath(allocator);
+    const identity_file = if (machine.ssh_identity_file) |configured|
+        try paths.expandUserPath(allocator, configured)
+    else
+        try paths.defaultManagedPrivateKeyPath(allocator);
     errdefer allocator.free(identity_file);
 
     return .{

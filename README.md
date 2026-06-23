@@ -114,7 +114,13 @@ rove down <name> [--json]
 
 Fly targets are useful for CPU devboxes and long-lived base images.
 
-First build and publish the image from [`infra/fly/devbox/`](infra/fly/devbox/README.md), then pin the resulting image digest:
+Rove does not own the devbox image build or publish path. Build and publish the
+image from the dotfiles-owned image project, for example:
+
+- `~/Documents/Code/dotfiles/images/mesh-devbox`
+- `~/Documents/Code/dotfiles/deploy/fly/mesh-devbox`
+
+Then pin the resulting image digest in the Rove target config:
 
 ```bash
 ./scripts/pin-image-ref.sh devbox 'registry.fly.io/your-fly-app:latest@sha256:<digest>'
@@ -132,7 +138,14 @@ Example target:
     "app": "your-fly-app",
     "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
     "vm_size": "shared-cpu-2x",
-    "region": "iad"
+    "ports": [],
+    "inject_authorized_keys": false,
+    "ssh_host": "mesh-{name}",
+    "ssh_port": 2222,
+    "env": {
+      "TAILSCALE_HOSTNAME": "mesh-{name}",
+      "TAILSCALE_SERVE_SSH": "1"
+    }
   }
 }
 ```
@@ -143,6 +156,14 @@ Fly fields:
 - `vm_size`: Fly machine size
 - `region`: optional fixed region
 - `region_preference`: optional ordered list of preferred regions
+- `ports`: optional Fly public port mappings. If omitted, Rove preserves the old default `22:2222/tcp`; use `[]` for no public Fly service.
+- `env`: optional launch-time environment variables. String values support `{name}`, `{machine_name}`, and `{app}` templates.
+- `inject_authorized_keys`: defaults to `true`; set to `false` when the image/provider already receives authorized keys from app secrets.
+- `ssh_host`: optional SSH host template stored in Rove state after launch.
+- `ssh_port`: optional SSH port stored in Rove state after launch.
+
+Target fields:
+- `ssh_identity_file`: optional private key path for Rove's SSH operations. Omit it to use Rove's managed key; if `inject_authorized_keys` is `false`, make sure the provider/app secret contains the matching public key.
 
 Legacy top-level Fly fields are still accepted for older configs, but new configs should use the nested `fly` block.
 
@@ -329,7 +350,8 @@ Current defaults:
 - SSH agent forwarding is disabled by Rove's client invocation.
 - TCP, stream-local, and tunnel forwarding are disabled by Rove's client invocation.
 - SSH known-host entries are isolated under `~/.rove/known_hosts`.
-- Fly's provided devbox image disables root login and rewrites authorized keys to `restrict,pty`.
+- Fly targets can opt out of public Fly services with `ports: []` and use a private-network `ssh_host` instead.
+- The externally published Fly devbox image is expected to disable root login and restrict authorized keys; Rove only pins and launches that image.
 - Vast instances run whatever image/template you choose; validate image defaults yourself.
 
 Important limitation:
