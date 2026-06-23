@@ -95,6 +95,10 @@ fn runBatchCommandWithRecovery(
     remote_command: []const u8,
     allow_host_key_recovery: bool,
 ) !exec.Result {
+    if (machine.provider == .fly and machine.app != null) {
+        return runFlyMachineCommand(allocator, machine, remote_command);
+    }
+
     const connection = try prepareConnection(allocator, machine);
     defer connection.deinit(allocator);
     const wrapped_command = try wrappedRemoteCommand(allocator, remote_command);
@@ -116,6 +120,31 @@ fn runBatchCommandWithRecovery(
     }
 
     return result;
+}
+
+fn runFlyMachineCommand(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    remote_command: []const u8,
+) !exec.Result {
+    const app = machine.app orelse machine.provider_scope orelse return error.MissingProviderScope;
+    const wrapped_command = try wrappedRemoteCommand(allocator, remote_command);
+    defer allocator.free(wrapped_command);
+
+    return exec.run(allocator, &.{
+        "flyctl",
+        "ssh",
+        "console",
+        "--quiet",
+        "--app",
+        app,
+        "--machine",
+        machine.id,
+        "--user",
+        machine.ssh_user,
+        "--command",
+        wrapped_command,
+    });
 }
 
 pub fn uploadFile(

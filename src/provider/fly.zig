@@ -30,6 +30,13 @@ pub fn create(
         machine_name,
         "--vm-size",
         fly_config.vm_size,
+    });
+
+    if (fly_config.vm_memory) |memory| {
+        try args.appendSlice(allocator, &.{ "--vm-memory", memory });
+    }
+
+    try args.appendSlice(allocator, &.{
         "--port",
         "22:2222/tcp",
         "--metadata",

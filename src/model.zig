@@ -20,6 +20,7 @@ pub const FlyTargetConfig = struct {
     app: []const u8 = "",
     image: []const u8 = "",
     vm_size: []const u8 = "",
+    vm_memory: ?[]const u8 = null,
     region: ?[]const u8 = null,
     region_preference: ?[]const []const u8 = null,
 };
@@ -45,6 +46,7 @@ pub const TargetConfig = struct {
     app: []const u8 = "",
     image: []const u8 = "",
     vm_size: []const u8 = "",
+    vm_memory: ?[]const u8 = null,
     region: ?[]const u8 = null,
     region_preference: ?[]const []const u8 = null,
     ssh_user: []const u8,

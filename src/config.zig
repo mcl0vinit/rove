@@ -68,6 +68,7 @@ pub fn resolveFlyTarget(target: model.TargetConfig) model.FlyTargetConfig {
             .app = if (fly.app.len > 0) fly.app else target.app,
             .image = if (fly.image.len > 0) fly.image else target.image,
             .vm_size = if (fly.vm_size.len > 0) fly.vm_size else target.vm_size,
+            .vm_memory = fly.vm_memory orelse target.vm_memory,
             .region = fly.region orelse target.region,
             .region_preference = fly.region_preference orelse target.region_preference,
         };
@@ -77,6 +78,7 @@ pub fn resolveFlyTarget(target: model.TargetConfig) model.FlyTargetConfig {
         .app = target.app,
         .image = target.image,
         .vm_size = target.vm_size,
+        .vm_memory = target.vm_memory,
         .region = target.region,
         .region_preference = target.region_preference,
     };
@@ -138,7 +140,8 @@ test "parse and resolve target with provider scoped fly config" {
         \\      "fly": {
         \\        "app": "devbox",
         \\        "image": "registry.fly.io/devbox:latest",
-        \\        "vm_size": "shared-cpu-2x"
+        \\        "vm_size": "shared-cpu-2x",
+        \\        "vm_memory": "2048"
         \\      }
         \\    }
         \\  ]
@@ -157,6 +160,7 @@ test "parse and resolve target with provider scoped fly config" {
     try std.testing.expectEqualStrings("devbox", fly.app);
     try std.testing.expectEqualStrings("registry.fly.io/devbox:latest", fly.image);
     try std.testing.expectEqualStrings("shared-cpu-2x", fly.vm_size);
+    try std.testing.expectEqualStrings("2048", fly.vm_memory.?);
 }
 
 test "parse legacy top-level fly config" {
