@@ -167,6 +167,39 @@ Target fields:
 
 Legacy top-level Fly fields are still accepted for older configs, but new configs should use the nested `fly` block.
 
+### Private Fly Smoke Test
+
+For private-only Fly targets, use the smoke helper after publishing and pinning
+a new image:
+
+```bash
+nix develop -c zig build
+nix develop -c scripts/private-fly-smoke.sh --target devbox
+```
+
+The helper launches a uniquely named machine, records phase timings, checks that
+the machine has no Fly services, checks that the app has no public ingress IPs,
+waits for private SSH, runs `rove exec`, and destroys the machine on success.
+Use `--jsonl` for machine-readable event output.
+
+The default private path expects these app secrets by name:
+
+- `AUTHORIZED_KEYS`: public keys only. Include `~/.rove/id_ed25519.pub` for
+  Rove automation.
+- `MESH_TAILSCALE_AUTHKEY`: runtime Tailscale auth key.
+
+Keep `ssh_identity_file` unset unless you know the private key can sign in
+batch mode. Passphrase-protected personal keys can be accepted by the server but
+still fail noninteractive Rove SSH.
+
+Fly may report app secrets as `Staged` when using `fly machine run` without an
+app release. A newly created Machine still receives staged secrets at boot; use
+the smoke helper to prove the actual runtime path.
+
+If `mesh-{name}` does not resolve locally, confirm the node appears in
+`tailscale status` and retry from the same shell used for Rove. You can also use
+the full tailnet DNS name from `tailscale status` while debugging.
+
 ## Vast.ai Targets
 
 Vast targets are useful for short-lived GPU machines. Rove searches offers, rents an instance, requests direct SSH, attaches Rove's managed SSH public key, records the returned `ssh_host` and `ssh_port`, then uses the normal Rove SSH/bootstrap flow.
