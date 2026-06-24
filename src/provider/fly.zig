@@ -12,60 +12,27 @@ pub fn create(
     const machine_name = try generatedMachineName(allocator, request.instance_name);
     defer allocator.free(machine_name);
 
-    const managed_key = try keys.ensureManagedKeyPair(allocator);
-    defer managed_key.deinit(allocator);
+    var managed_key: ?keys.ManagedKeyPair = null;
+    defer if (managed_key) |key| key.deinit(allocator);
+    var authorized_key: ?[]const u8 = null;
+    if (fly_config.inject_authorized_keys) {
+        authorized_key = request.authorized_key orelse blk: {
+            managed_key = try keys.ensureManagedKeyPair(allocator);
+            break :blk managed_key.?.public_key;
+        };
+    }
 
-    var args = std.ArrayListUnmanaged([]const u8){};
-    defer args.deinit(allocator);
-
-    try args.appendSlice(allocator, &.{
-        "flyctl",
-        "machine",
-        "run",
-        fly_config.image,
-        "--app",
-        fly_config.app,
-        "--detach",
-        "--name",
+    var launch_args = try buildMachineRunArgs(
+        allocator,
+        fly_config,
+        request.target_name,
+        request.instance_name,
         machine_name,
-        "--vm-size",
-        fly_config.vm_size,
-    });
+        authorized_key,
+    );
+    defer launch_args.deinit(allocator);
 
-    if (fly_config.vm_memory) |memory| {
-        try args.appendSlice(allocator, &.{ "--vm-memory", memory });
-    }
-
-    try args.appendSlice(allocator, &.{
-        "--port",
-        "22:2222/tcp",
-        "--metadata",
-    });
-
-    const managed_metadata = try std.fmt.allocPrint(allocator, "rove_managed=true", .{});
-    defer allocator.free(managed_metadata);
-    try args.append(allocator, managed_metadata);
-
-    try args.append(allocator, "--metadata");
-    const target_metadata = try std.fmt.allocPrint(allocator, "rove_target={s}", .{request.target_name});
-    defer allocator.free(target_metadata);
-    try args.append(allocator, target_metadata);
-
-    try args.append(allocator, "--metadata");
-    const instance_metadata = try std.fmt.allocPrint(allocator, "rove_instance={s}", .{request.instance_name});
-    defer allocator.free(instance_metadata);
-    try args.append(allocator, instance_metadata);
-
-    try args.append(allocator, "--env");
-    const authorized_keys_env = try std.fmt.allocPrint(allocator, "ROVE_AUTHORIZED_KEYS={s}", .{managed_key.public_key});
-    defer allocator.free(authorized_keys_env);
-    try args.append(allocator, authorized_keys_env);
-
-    if (selectedRegion(fly_config)) |region| {
-        try args.appendSlice(allocator, &.{ "--region", region });
-    }
-
-    const run_result = try exec.run(allocator, args.items);
+    const run_result = try exec.run(allocator, launch_args.args.items);
     defer run_result.deinit(allocator);
 
     if (!run_result.succeeded()) {
@@ -78,7 +45,8 @@ pub fn create(
 
     return .{
         .machine_id = try allocator.dupe(u8, machine.id.?),
-        .host = try std.fmt.allocPrint(allocator, "{s}.fly.dev", .{fly_config.app}),
+        .host = try renderSshHost(allocator, fly_config, request.instance_name, machine_name),
+        .ssh_port = sshPortForConfig(fly_config),
         .region = if (machine.region) |region| try allocator.dupe(u8, region) else null,
         .machine_name = if (machine.name) |name| try allocator.dupe(u8, name) else null,
     };
@@ -123,7 +91,8 @@ pub fn inspect(
     return .{
         .exists = true,
         .machine_name = if (machine.name) |name| try allocator.dupe(u8, name) else null,
-        .host = try std.fmt.allocPrint(allocator, "{s}.fly.dev", .{fly_config.app}),
+        .host = try renderSshHost(allocator, fly_config, request.instance_name, machine.name),
+        .ssh_port = sshPortForConfig(fly_config),
         .region = if (machine.region) |region| try allocator.dupe(u8, region) else null,
         .remote_state = if (machine.state) |state| try allocator.dupe(u8, state) else null,
     };
@@ -154,6 +123,81 @@ const FoundMachine = struct {
         if (self.region) |region| allocator.free(region);
     }
 };
+
+const MachineRunArgs = struct {
+    args: std.ArrayListUnmanaged([]const u8) = .{},
+    owned_arg_values: std.ArrayListUnmanaged([]u8) = .{},
+
+    fn deinit(self: *MachineRunArgs, allocator: std.mem.Allocator) void {
+        self.args.deinit(allocator);
+        for (self.owned_arg_values.items) |value| allocator.free(value);
+        self.owned_arg_values.deinit(allocator);
+        self.* = .{};
+    }
+};
+
+fn buildMachineRunArgs(
+    allocator: std.mem.Allocator,
+    fly_config: model.FlyTargetConfig,
+    target_name: []const u8,
+    instance_name: []const u8,
+    machine_name: []const u8,
+    authorized_key: ?[]const u8,
+) !MachineRunArgs {
+    var run_args = MachineRunArgs{};
+    errdefer run_args.deinit(allocator);
+
+    try run_args.args.appendSlice(allocator, &.{
+        "flyctl",
+        "machine",
+        "run",
+        fly_config.image,
+        "--app",
+        fly_config.app,
+        "--detach",
+        "--name",
+        machine_name,
+        "--vm-size",
+        fly_config.vm_size,
+    });
+
+    if (fly_config.vm_memory) |memory| {
+        try run_args.args.appendSlice(allocator, &.{ "--vm-memory", memory });
+    }
+
+    try appendMetadataArg(allocator, &run_args, "rove_managed", "true");
+    try appendMetadataArg(allocator, &run_args, "rove_target", target_name);
+    try appendMetadataArg(allocator, &run_args, "rove_instance", instance_name);
+
+    try appendPortArgs(allocator, &run_args.args, &run_args.owned_arg_values, fly_config);
+    try appendConfiguredEnv(allocator, &run_args.args, &run_args.owned_arg_values, fly_config, instance_name, machine_name);
+
+    if (fly_config.inject_authorized_keys) {
+        const public_key = authorized_key orelse return error.MissingAuthorizedKey;
+        try run_args.args.append(allocator, "--env");
+        const authorized_keys_env = try std.fmt.allocPrint(allocator, "ROVE_AUTHORIZED_KEYS={s}", .{public_key});
+        try run_args.owned_arg_values.append(allocator, authorized_keys_env);
+        try run_args.args.append(allocator, authorized_keys_env);
+    }
+
+    if (selectedRegion(fly_config)) |region| {
+        try run_args.args.appendSlice(allocator, &.{ "--region", region });
+    }
+
+    return run_args;
+}
+
+fn appendMetadataArg(
+    allocator: std.mem.Allocator,
+    run_args: *MachineRunArgs,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    try run_args.args.append(allocator, "--metadata");
+    const rendered = try std.fmt.allocPrint(allocator, "{s}={s}", .{ key, value });
+    try run_args.owned_arg_values.append(allocator, rendered);
+    try run_args.args.append(allocator, rendered);
+}
 
 fn generatedMachineName(
     allocator: std.mem.Allocator,
@@ -203,6 +247,140 @@ fn machineNameSlug(
 
     if (out.items.len == 0) {
         try out.appendSlice(allocator, "machine");
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendPortArgs(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayListUnmanaged([]const u8),
+    owned_arg_values: *std.ArrayListUnmanaged([]u8),
+    fly_config: model.FlyTargetConfig,
+) !void {
+    if (fly_config.ports) |ports| {
+        if (ports.len != 0 and !fly_config.allow_public_ports) {
+            return error.PublicFlyPortsRequireOptIn;
+        }
+        for (ports) |port| {
+            try args.append(allocator, "--port");
+            const rendered = try std.fmt.allocPrint(allocator, "{d}:{d}/{s}", .{
+                port.external,
+                port.internal,
+                port.protocol,
+            });
+            try owned_arg_values.append(allocator, rendered);
+            try args.append(allocator, rendered);
+        }
+        return;
+    }
+}
+
+fn appendConfiguredEnv(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayListUnmanaged([]const u8),
+    owned_arg_values: *std.ArrayListUnmanaged([]u8),
+    fly_config: model.FlyTargetConfig,
+    instance_name: []const u8,
+    machine_name: []const u8,
+) !void {
+    const env = fly_config.env orelse return;
+    var iterator = env.object.iterator();
+    while (iterator.next()) |entry| {
+        const rendered_value = try renderEnvValue(
+            allocator,
+            entry.value_ptr.*,
+            fly_config.app,
+            instance_name,
+            machine_name,
+        );
+        defer allocator.free(rendered_value);
+
+        try args.append(allocator, "--env");
+        const rendered_env = try std.fmt.allocPrint(allocator, "{s}={s}", .{
+            entry.key_ptr.*,
+            rendered_value,
+        });
+        try owned_arg_values.append(allocator, rendered_env);
+        try args.append(allocator, rendered_env);
+    }
+}
+
+fn renderEnvValue(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    app: []const u8,
+    instance_name: []const u8,
+    machine_name: []const u8,
+) ![]u8 {
+    return switch (value) {
+        .string => |string| try renderTemplate(allocator, string, app, instance_name, machine_name),
+        .integer => |integer| try std.fmt.allocPrint(allocator, "{d}", .{integer}),
+        .float => |float| try std.fmt.allocPrint(allocator, "{d}", .{float}),
+        .number_string => |number_string| allocator.dupe(u8, number_string),
+        .bool => |boolean| allocator.dupe(u8, if (boolean) "true" else "false"),
+        else => error.InvalidFlyEnv,
+    };
+}
+
+fn renderSshHost(
+    allocator: std.mem.Allocator,
+    fly_config: model.FlyTargetConfig,
+    instance_name: ?[]const u8,
+    machine_name: ?[]const u8,
+) ![]u8 {
+    const template = fly_config.ssh_host orelse {
+        return std.fmt.allocPrint(allocator, "{s}.fly.dev", .{fly_config.app});
+    };
+
+    return renderTemplate(
+        allocator,
+        template,
+        fly_config.app,
+        instance_name orelse "",
+        machine_name orelse "",
+    );
+}
+
+fn sshPortForConfig(fly_config: model.FlyTargetConfig) u16 {
+    if (fly_config.ssh_port) |ssh_port| return ssh_port;
+
+    if (fly_config.ports) |ports| {
+        for (ports) |port| {
+            if (port.internal == 2222 and std.ascii.eqlIgnoreCase(port.protocol, "tcp")) {
+                return port.external;
+            }
+        }
+    }
+
+    return 22;
+}
+
+fn renderTemplate(
+    allocator: std.mem.Allocator,
+    template: []const u8,
+    app: []const u8,
+    instance_name: []const u8,
+    machine_name: []const u8,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    defer out.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < template.len) {
+        if (std.mem.startsWith(u8, template[index..], "{name}")) {
+            try out.appendSlice(allocator, instance_name);
+            index += "{name}".len;
+        } else if (std.mem.startsWith(u8, template[index..], "{machine_name}")) {
+            try out.appendSlice(allocator, machine_name);
+            index += "{machine_name}".len;
+        } else if (std.mem.startsWith(u8, template[index..], "{app}")) {
+            try out.appendSlice(allocator, app);
+            index += "{app}".len;
+        } else {
+            try out.append(allocator, template[index]);
+            index += 1;
+        }
     }
 
     return out.toOwnedSlice(allocator);
@@ -341,6 +519,209 @@ test "select first preferred region when fixed region is absent" {
     try std.testing.expectEqualStrings("iad", selectedRegion(target).?);
 }
 
+test "render fly launch templates" {
+    const allocator = std.testing.allocator;
+    const rendered = try renderTemplate(allocator, "mesh-{name}-{machine_name}-{app}", "devbox", "work", "rove-work-1234");
+    defer allocator.free(rendered);
+
+    try std.testing.expectEqualStrings("mesh-work-rove-work-1234-devbox", rendered);
+}
+
+test "default fly machine run args omit public ssh launch path" {
+    const allocator = std.testing.allocator;
+    var run_args = try buildMachineRunArgs(
+        allocator,
+        .{
+            .app = "devbox",
+            .image = "registry.fly.io/devbox:latest",
+            .vm_size = "shared-cpu-2x",
+        },
+        "devbox",
+        "work",
+        "rove-work-1234",
+        "ssh-ed25519 AAAATEST rove-test",
+    );
+    defer run_args.deinit(allocator);
+
+    const expected = [_][]const u8{
+        "flyctl",
+        "machine",
+        "run",
+        "registry.fly.io/devbox:latest",
+        "--app",
+        "devbox",
+        "--detach",
+        "--name",
+        "rove-work-1234",
+        "--vm-size",
+        "shared-cpu-2x",
+        "--metadata",
+        "rove_managed=true",
+        "--metadata",
+        "rove_target=devbox",
+        "--metadata",
+        "rove_instance=work",
+        "--env",
+        "ROVE_AUTHORIZED_KEYS=ssh-ed25519 AAAATEST rove-test",
+    };
+    try expectArgsEqual(expected[0..], run_args.args.items);
+    try expectArgAbsent(run_args.args.items, "--port");
+}
+
+test "private fly machine run args omit public ssh and render env" {
+    const allocator = std.testing.allocator;
+    var parsed_env = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{
+        \\  "TAILSCALE_HOSTNAME": "mesh-{name}",
+        \\  "TAILSCALE_SERVE_SSH": "1"
+        \\}
+    , .{ .allocate = .alloc_always });
+    defer parsed_env.deinit();
+
+    const fly_config = model.FlyTargetConfig{
+        .app = "devbox",
+        .image = "registry.fly.io/devbox:latest",
+        .vm_size = "shared-cpu-2x",
+        .ports = &.{},
+        .env = parsed_env.value,
+        .inject_authorized_keys = false,
+        .ssh_host = "mesh-{name}",
+        .ssh_port = 2222,
+    };
+
+    var run_args = try buildMachineRunArgs(
+        allocator,
+        fly_config,
+        "devbox",
+        "work",
+        "rove-work-1234",
+        null,
+    );
+    defer run_args.deinit(allocator);
+
+    const expected = [_][]const u8{
+        "flyctl",
+        "machine",
+        "run",
+        "registry.fly.io/devbox:latest",
+        "--app",
+        "devbox",
+        "--detach",
+        "--name",
+        "rove-work-1234",
+        "--vm-size",
+        "shared-cpu-2x",
+        "--metadata",
+        "rove_managed=true",
+        "--metadata",
+        "rove_target=devbox",
+        "--metadata",
+        "rove_instance=work",
+        "--env",
+        "TAILSCALE_HOSTNAME=mesh-work",
+        "--env",
+        "TAILSCALE_SERVE_SSH=1",
+    };
+    try expectArgsEqual(expected[0..], run_args.args.items);
+    try expectArgAbsent(run_args.args.items, "--port");
+    try expectArgPrefixAbsent(run_args.args.items, "ROVE_AUTHORIZED_KEYS=");
+
+    const host = try renderSshHost(allocator, fly_config, "work", "rove-work-1234");
+    defer allocator.free(host);
+    try std.testing.expectEqualStrings("mesh-work", host);
+    try std.testing.expectEqual(@as(u16, 2222), sshPortForConfig(fly_config));
+}
+
+test "empty configured ports emit no fly public port args" {
+    const allocator = std.testing.allocator;
+    var args = std.ArrayListUnmanaged([]const u8){};
+    defer args.deinit(allocator);
+    var owned = std.ArrayListUnmanaged([]u8){};
+    defer {
+        for (owned.items) |value| allocator.free(value);
+        owned.deinit(allocator);
+    }
+
+    try appendPortArgs(allocator, &args, &owned, .{
+        .app = "devbox",
+        .image = "registry.fly.io/devbox:latest",
+        .vm_size = "shared-cpu-2x",
+        .ports = &.{},
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), args.items.len);
+}
+
+test "default fly ports emit no public mapping" {
+    const allocator = std.testing.allocator;
+    var args = std.ArrayListUnmanaged([]const u8){};
+    defer args.deinit(allocator);
+    var owned = std.ArrayListUnmanaged([]u8){};
+    defer {
+        for (owned.items) |value| allocator.free(value);
+        owned.deinit(allocator);
+    }
+
+    try appendPortArgs(allocator, &args, &owned, .{
+        .app = "devbox",
+        .image = "registry.fly.io/devbox:latest",
+        .vm_size = "shared-cpu-2x",
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), args.items.len);
+}
+
+test "configured public fly ports require explicit opt in" {
+    const allocator = std.testing.allocator;
+    var args = std.ArrayListUnmanaged([]const u8){};
+    defer args.deinit(allocator);
+    var owned = std.ArrayListUnmanaged([]u8){};
+    defer {
+        for (owned.items) |value| allocator.free(value);
+        owned.deinit(allocator);
+    }
+
+    const public_ports = [_]model.FlyPortConfig{
+        .{ .external = 22, .internal = 2222, .protocol = "tcp" },
+    };
+
+    try std.testing.expectError(error.PublicFlyPortsRequireOptIn, appendPortArgs(allocator, &args, &owned, .{
+        .app = "devbox",
+        .image = "registry.fly.io/devbox:latest",
+        .vm_size = "shared-cpu-2x",
+        .ports = public_ports[0..],
+    }));
+
+    try appendPortArgs(allocator, &args, &owned, .{
+        .app = "devbox",
+        .image = "registry.fly.io/devbox:latest",
+        .vm_size = "shared-cpu-2x",
+        .ports = public_ports[0..],
+        .allow_public_ports = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), args.items.len);
+    try std.testing.expectEqualStrings("--port", args.items[0]);
+    try std.testing.expectEqualStrings("22:2222/tcp", args.items[1]);
+}
+
+test "private ssh host and port come from config" {
+    const allocator = std.testing.allocator;
+    const fly_config = model.FlyTargetConfig{
+        .app = "devbox",
+        .image = "registry.fly.io/devbox:latest",
+        .vm_size = "shared-cpu-2x",
+        .ports = &.{},
+        .ssh_host = "mesh-{name}",
+        .ssh_port = 2222,
+    };
+    const host = try renderSshHost(allocator, fly_config, "work", "rove-work-1234");
+    defer allocator.free(host);
+
+    try std.testing.expectEqualStrings("mesh-work", host);
+    try std.testing.expectEqual(@as(u16, 2222), sshPortForConfig(fly_config));
+}
+
 test "machine name slug normalizes instance names" {
     const allocator = std.testing.allocator;
     const slug = try machineNameSlug(allocator, "Devbox Sam.Work");
@@ -372,4 +753,23 @@ test "listed machine parsing ignores extra fly fields" {
     try std.testing.expect(found != null);
     try std.testing.expectEqualStrings("123", found.?.id.?);
     try std.testing.expectEqualStrings("iad", found.?.region.?);
+}
+
+fn expectArgsEqual(expected: []const []const u8, actual: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |expected_arg, actual_arg| {
+        try std.testing.expectEqualStrings(expected_arg, actual_arg);
+    }
+}
+
+fn expectArgAbsent(args: []const []const u8, needle: []const u8) !void {
+    for (args) |arg| {
+        try std.testing.expect(!std.mem.eql(u8, arg, needle));
+    }
+}
+
+fn expectArgPrefixAbsent(args: []const []const u8, prefix: []const u8) !void {
+    for (args) |arg| {
+        try std.testing.expect(!std.mem.startsWith(u8, arg, prefix));
+    }
 }

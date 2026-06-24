@@ -4,11 +4,18 @@
       "name": "devbox",
       "provider": "fly",
       "ssh_user": "rove",
-      "startup_script": "./scripts/bootstrap.sh",
       "fly": {
         "app": "your-fly-app",
-        "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
-        "vm_size": "shared-cpu-2x"
+        "image": "registry.fly.io/your-fly-app:deployment-<id>@sha256:<digest>",
+        "vm_size": "shared-cpu-2x",
+        "ports": [],
+        "inject_authorized_keys": false,
+        "ssh_host": "mesh-{name}",
+        "ssh_port": 2222,
+        "env": {
+          "TAILSCALE_HOSTNAME": "mesh-{name}",
+          "TAILSCALE_SERVE_SSH": "1"
+        }
       }
     }
   ]

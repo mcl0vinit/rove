@@ -15,6 +15,10 @@ pub const Error = std.fs.File.OpenError ||
         MissingVmSize,
         MissingSshUser,
         MissingRegionPreference,
+        InvalidFlyEnv,
+        InvalidFlyPort,
+        PublicFlyPortsRequireOptIn,
+        InvalidSshPort,
         TargetNotFound,
     };
 
@@ -71,6 +75,12 @@ pub fn resolveFlyTarget(target: model.TargetConfig) model.FlyTargetConfig {
             .vm_memory = fly.vm_memory orelse target.vm_memory,
             .region = fly.region orelse target.region,
             .region_preference = fly.region_preference orelse target.region_preference,
+            .ports = fly.ports,
+            .allow_public_ports = fly.allow_public_ports,
+            .env = fly.env,
+            .inject_authorized_keys = fly.inject_authorized_keys,
+            .ssh_host = fly.ssh_host,
+            .ssh_port = fly.ssh_port,
         };
     }
 
@@ -104,6 +114,30 @@ fn validate(
                 if (fly.vm_size.len == 0) return error.MissingVmSize;
                 if (fly.region_preference) |preference| {
                     if (preference.len == 0) return error.MissingRegionPreference;
+                }
+                if (fly.ports) |ports| {
+                    if (ports.len != 0 and !fly.allow_public_ports) {
+                        return error.PublicFlyPortsRequireOptIn;
+                    }
+                    for (ports) |port| {
+                        if (port.external == 0 or port.internal == 0 or port.protocol.len == 0) {
+                            return error.InvalidFlyPort;
+                        }
+                    }
+                }
+                if (fly.env) |env| {
+                    if (env != .object) return error.InvalidFlyEnv;
+                    var iterator = env.object.iterator();
+                    while (iterator.next()) |entry| {
+                        if (entry.key_ptr.*.len == 0) return error.InvalidFlyEnv;
+                        switch (entry.value_ptr.*) {
+                            .string, .integer, .float, .number_string, .bool => {},
+                            else => return error.InvalidFlyEnv,
+                        }
+                    }
+                }
+                if (fly.ssh_port) |ssh_port| {
+                    if (ssh_port == 0) return error.InvalidSshPort;
                 }
             },
             .vast => {
@@ -161,6 +195,117 @@ test "parse and resolve target with provider scoped fly config" {
     try std.testing.expectEqualStrings("registry.fly.io/devbox:latest", fly.image);
     try std.testing.expectEqualStrings("shared-cpu-2x", fly.vm_size);
     try std.testing.expectEqualStrings("2048", fly.vm_memory.?);
+}
+
+test "parse fly private access launch options" {
+    const allocator = std.testing.allocator;
+    const contents =
+        \\{
+        \\  "targets": [
+        \\    {
+        \\      "name": "devbox",
+        \\      "provider": "fly",
+        \\      "ssh_user": "rove",
+        \\      "ssh_identity_file": "~/.ssh/id_ed25519",
+        \\      "fly": {
+        \\        "app": "devbox",
+        \\        "image": "registry.fly.io/devbox:latest",
+        \\        "vm_size": "shared-cpu-2x",
+        \\        "ports": [],
+        \\        "inject_authorized_keys": false,
+        \\        "ssh_host": "mesh-{name}",
+        \\        "ssh_port": 2222,
+        \\        "env": {
+        \\          "TAILSCALE_HOSTNAME": "mesh-{name}",
+        \\          "TAILSCALE_SERVE_SSH": "1"
+        \\        }
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var parsed = try parseSlice(allocator, contents, ValidationOptions{
+        .check_startup_script_paths = false,
+    });
+    defer parsed.deinit();
+
+    const target = try resolveTarget(&parsed.value, "devbox");
+    try std.testing.expectEqualStrings("~/.ssh/id_ed25519", target.ssh_identity_file.?);
+
+    const fly = resolveFlyTarget(target.*);
+    try std.testing.expect(fly.ports != null);
+    try std.testing.expectEqual(@as(usize, 0), fly.ports.?.len);
+    try std.testing.expect(!fly.allow_public_ports);
+    try std.testing.expect(!fly.inject_authorized_keys);
+    try std.testing.expectEqualStrings("mesh-{name}", fly.ssh_host.?);
+    try std.testing.expectEqual(@as(u16, 2222), fly.ssh_port.?);
+    try std.testing.expect(fly.env != null);
+    try std.testing.expect(fly.env.? == .object);
+}
+
+test "reject public fly ports without explicit opt in" {
+    const allocator = std.testing.allocator;
+    const contents =
+        \\{
+        \\  "targets": [
+        \\    {
+        \\      "name": "devbox",
+        \\      "provider": "fly",
+        \\      "ssh_user": "rove",
+        \\      "fly": {
+        \\        "app": "devbox",
+        \\        "image": "registry.fly.io/devbox:latest",
+        \\        "vm_size": "shared-cpu-2x",
+        \\        "ports": [
+        \\          { "external": 22, "internal": 2222, "protocol": "tcp" }
+        \\        ]
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    try std.testing.expectError(
+        error.PublicFlyPortsRequireOptIn,
+        parseSlice(allocator, contents, ValidationOptions{
+            .check_startup_script_paths = false,
+        }),
+    );
+}
+
+test "accept public fly ports with explicit opt in" {
+    const allocator = std.testing.allocator;
+    const contents =
+        \\{
+        \\  "targets": [
+        \\    {
+        \\      "name": "devbox",
+        \\      "provider": "fly",
+        \\      "ssh_user": "rove",
+        \\      "fly": {
+        \\        "app": "devbox",
+        \\        "image": "registry.fly.io/devbox:latest",
+        \\        "vm_size": "shared-cpu-2x",
+        \\        "allow_public_ports": true,
+        \\        "ports": [
+        \\          { "external": 22, "internal": 2222, "protocol": "tcp" }
+        \\        ]
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var parsed = try parseSlice(allocator, contents, ValidationOptions{
+        .check_startup_script_paths = false,
+    });
+    defer parsed.deinit();
+
+    const target = try resolveTarget(&parsed.value, "devbox");
+    const fly = resolveFlyTarget(target.*);
+    try std.testing.expect(fly.allow_public_ports);
+    try std.testing.expectEqual(@as(usize, 1), fly.ports.?.len);
 }
 
 test "parse legacy top-level fly config" {

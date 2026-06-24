@@ -7,9 +7,17 @@
       "startup_script": "../dotfiles/bin/bootstrap-remote",
       "fly": {
         "app": "mcl0vinit-devbox",
-        "image": "registry.fly.io/mcl0vinit-devbox:latest@sha256:bfb26787a0a5e8ce92479a2f0d611d418bdab207ec581d68c0742e46c58dc726",
+        "image": "registry.fly.io/mcl0vinit-devbox:deployment-01KVTFR79PTCVNAD8JBA38RXN3@sha256:6db0aefa4613bf40ab10fa29856638da8ab0c9586228e5047b2fa7a3d0a17a26",
         "vm_size": "shared-cpu-2x",
-        "vm_memory": "2048"
+        "vm_memory": "2048",
+        "ports": [],
+        "inject_authorized_keys": false,
+        "ssh_host": "mesh-{name}",
+        "ssh_port": 2222,
+        "env": {
+          "TAILSCALE_HOSTNAME": "mesh-{name}",
+          "TAILSCALE_SERVE_SSH": "1"
+        }
       }
     }
   ]

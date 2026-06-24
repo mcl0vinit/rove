@@ -5,6 +5,12 @@ pub const ProviderKind = enum {
     vast,
 };
 
+pub const FlyPortConfig = struct {
+    external: u16,
+    internal: u16,
+    protocol: []const u8 = "tcp",
+};
+
 pub const LifecycleStatus = enum {
     creating,
     provisioned,
@@ -23,6 +29,12 @@ pub const FlyTargetConfig = struct {
     vm_memory: ?[]const u8 = null,
     region: ?[]const u8 = null,
     region_preference: ?[]const []const u8 = null,
+    ports: ?[]const FlyPortConfig = null,
+    allow_public_ports: bool = false,
+    env: ?std.json.Value = null,
+    inject_authorized_keys: bool = true,
+    ssh_host: ?[]const u8 = null,
+    ssh_port: ?u16 = null,
 };
 
 pub const VastTargetConfig = struct {
@@ -50,6 +62,7 @@ pub const TargetConfig = struct {
     region: ?[]const u8 = null,
     region_preference: ?[]const []const u8 = null,
     ssh_user: []const u8,
+    ssh_identity_file: ?[]const u8 = null,
     startup_script: ?[]const u8 = null,
     fly: ?FlyTargetConfig = null,
     vast: ?VastTargetConfig = null,
@@ -69,6 +82,7 @@ pub const MachineRecord = struct {
     app: ?[]const u8 = null,
     host: []const u8,
     ssh_port: u16 = 22,
+    ssh_identity_file: ?[]const u8 = null,
     region: ?[]const u8 = null,
     remote_state: ?[]const u8 = null,
     ssh_user: []const u8,

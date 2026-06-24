@@ -114,25 +114,51 @@ rove down <name> [--json]
 
 Fly targets are useful for CPU devboxes and long-lived base images.
 
-First build and publish the image from [`infra/fly/devbox/`](infra/fly/devbox/README.md), then pin the resulting image digest:
+For the baked Mesh devbox path, repository ownership is intentionally split:
+
+- dotfiles owns the image build, staging the Mesh Linux binary, Fly publish wrapper, and image boot behavior.
+- Rove owns machine launch, local machine state, and SSH reachability.
+- Mesh owns the control plane, peer validation, scan/status/grep, and tmux UX.
+
+Rove should receive an immutable image ref from the dotfiles Fly publish wrapper
+and pin that exact ref in `rove.json` or another local config. Do not put Fly
+tokens, Tailscale auth keys, SSH private keys, or secret values in tracked files.
+Run the publish wrapper from the dotfiles repo, then pass its
+`registry.fly.io/<fly-app>:<tag>@sha256:<digest>` output to Rove:
 
 ```bash
-./scripts/pin-image-ref.sh devbox 'registry.fly.io/your-fly-app:latest@sha256:<digest>'
+./scripts/pin-image-ref.sh devbox 'registry.fly.io/<fly-app>:<tag>@sha256:<digest>' rove.json
 ```
 
-Example target:
+Private Mesh devboxes should use Fly secrets as the source of truth for SSH keys
+and Tailscale auth. Set the secrets out of band and store only their names in
+documentation:
+
+```bash
+flyctl secrets set --app <fly-app> \
+  AUTHORIZED_KEYS='<public ssh keys only>' \
+  MESH_TAILSCALE_AUTHKEY='<tailscale auth key>'
+```
+
+Example private target:
 
 ```json
 {
   "name": "devbox",
   "provider": "fly",
   "ssh_user": "rove",
-  "startup_script": "../dotfiles/bin/bootstrap-remote",
   "fly": {
     "app": "your-fly-app",
-    "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
+    "image": "registry.fly.io/your-fly-app:deployment-<id>@sha256:<digest>",
     "vm_size": "shared-cpu-2x",
-    "region": "iad"
+    "ports": [],
+    "inject_authorized_keys": false,
+    "ssh_host": "mesh-{name}",
+    "ssh_port": 2222,
+    "env": {
+      "TAILSCALE_HOSTNAME": "mesh-{name}",
+      "TAILSCALE_SERVE_SSH": "1"
+    }
   }
 }
 ```
@@ -143,8 +169,83 @@ Fly fields:
 - `vm_size`: Fly machine size
 - `region`: optional fixed region
 - `region_preference`: optional ordered list of preferred regions
+- `ports`: optional Fly public port mappings. If omitted or set to `[]`, Rove opens no public Fly service ports.
+- `allow_public_ports`: defaults to `false`; must be `true` before any non-empty `ports` list is accepted.
+- `env`: optional launch-time environment variables. String values support `{name}`, `{machine_name}`, and `{app}` templates.
+- `inject_authorized_keys`: defaults to `true`; set to `false` when the image/provider already receives authorized keys from app secrets.
+- `ssh_host`: optional SSH host template stored in Rove state after launch.
+- `ssh_port`: optional SSH port stored in Rove state after launch.
+
+Target fields:
+- `ssh_identity_file`: optional private key path for Rove's SSH operations. Omit it to use Rove's managed key; if `inject_authorized_keys` is `false`, make sure the `AUTHORIZED_KEYS` Fly secret contains the matching public key.
+- `startup_script`: optional post-SSH bootstrap. The baked Mesh devbox image should not need this for `mesh` or `meshd`; dotfiles image boot owns that setup.
 
 Legacy top-level Fly fields are still accepted for older configs, but new configs should use the nested `fly` block.
+
+### Private Mesh Devbox Loop
+
+After publishing and pinning the image, launch through Rove:
+
+```bash
+rove doctor
+rove up devbox --name work
+rove inspect work --json
+```
+
+Verify that Rove reaches the machine over Tailscale Serve SSH, not public Fly
+ingress:
+
+```bash
+tailscale status | grep 'mesh-work'
+rove exec work -- hostname
+flyctl machine list --app <fly-app>
+flyctl ips list --app <fly-app>
+```
+
+For private-only targets, the machine should have no Fly services from Rove's
+launch args and the app should not need public ingress IPs for Rove SSH. Mesh
+validation happens from the Mesh repo or CLI after Rove can inspect and SSH to
+the machine.
+
+Public Fly service ports are intentionally a two-step opt-in. A non-empty
+`ports` list without `"allow_public_ports": true` is rejected before launch.
+
+### Private Fly Smoke Test
+
+For private-only Fly targets, use the smoke helper after publishing and pinning
+a new image:
+
+```bash
+nix develop -c zig build
+nix develop -c scripts/private-fly-smoke.sh --target devbox
+```
+
+The helper launches a uniquely named machine, records phase timings, checks that
+the machine has no Fly services, checks that the app has no public ingress IPs,
+waits for private SSH, runs `rove exec`, and destroys the machine on success.
+Use `--jsonl` for machine-readable event output.
+
+The default private path expects these app secrets by name:
+
+- `AUTHORIZED_KEYS`: public keys only. Include `~/.rove/id_ed25519.pub` for
+  Rove automation.
+- `MESH_TAILSCALE_AUTHKEY`: runtime Tailscale auth key.
+
+Keep `ssh_identity_file` unset unless you know the private key can sign in
+batch mode. Passphrase-protected personal keys can be accepted by the server but
+still fail noninteractive Rove SSH.
+
+Fly may report app secrets as `Staged` when using `fly machine run` without an
+app release. A newly created Machine still receives staged secrets at boot; use
+the smoke helper to prove the actual runtime path.
+
+Troubleshooting:
+- Missing secrets: confirm `flyctl secrets list --app <fly-app>` includes `AUTHORIZED_KEYS` and `MESH_TAILSCALE_AUTHKEY`; do not print secret values.
+- No Tailscale IP or DNS name: check the image boot logs from Fly, confirm the auth key is valid, and verify `TAILSCALE_HOSTNAME` rendered to the expected `mesh-<name>`.
+- Rove cannot SSH: confirm `tailscale status` shows the host, `nc -vz mesh-<name> 2222` succeeds, and the `AUTHORIZED_KEYS` secret includes Rove's public key.
+- Wrong image ref: run `rove doctor` and inspect the target image; repin to the digest emitted by the dotfiles publish wrapper.
+- Public ports accidentally configured: set `"ports": []` in the target and relaunch; omitted `ports` keeps Rove's legacy public SSH mapping.
+- Mesh peer validation fails: first prove `rove exec <name> -- hostname` works, then use Mesh-side diagnostics to inspect `meshd` state, listen address, and peer health.
 
 ## Vast.ai Targets
 
@@ -329,7 +430,8 @@ Current defaults:
 - SSH agent forwarding is disabled by Rove's client invocation.
 - TCP, stream-local, and tunnel forwarding are disabled by Rove's client invocation.
 - SSH known-host entries are isolated under `~/.rove/known_hosts`.
-- Fly's provided devbox image disables root login and rewrites authorized keys to `restrict,pty`.
+- Fly targets can opt out of public Fly services with `ports: []` and use a private-network `ssh_host` instead.
+- The externally published Fly devbox image is expected to disable root login and restrict authorized keys; Rove only pins and launches that image.
 - Vast instances run whatever image/template you choose; validate image defaults yourself.
 
 Important limitation:

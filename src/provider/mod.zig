@@ -13,6 +13,7 @@ pub const CreateRequest = struct {
     target_name: []const u8,
     provider_config: ProviderTargetConfig,
     instance_name: []const u8,
+    authorized_key: ?[]const u8 = null,
     verbose: bool = false,
 };
 
@@ -40,6 +41,7 @@ pub const DestroyRequest = struct {
 pub const InspectRequest = struct {
     provider_config: ProviderTargetConfig,
     machine_id: []const u8,
+    instance_name: ?[]const u8 = null,
 };
 
 pub const InspectResult = struct {
