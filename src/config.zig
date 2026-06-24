@@ -2,6 +2,8 @@ const std = @import("std");
 const model = @import("model.zig");
 const paths = @import("paths.zig");
 
+pub const config_env_var = "ROVE_CONFIG";
+
 pub const Error = std.fs.File.OpenError ||
     std.fs.File.ReadError ||
     std.fs.Dir.AccessError ||
@@ -29,12 +31,86 @@ const ValidationOptions = struct {
 pub fn load(
     allocator: std.mem.Allocator,
     path_override: ?[]const u8,
-) Error!std.json.Parsed(model.ConfigFile) {
-    const path = path_override orelse paths.defaultConfigPath();
+) !std.json.Parsed(model.ConfigFile) {
+    const path = try resolveConfigPath(allocator, path_override);
+    defer allocator.free(path);
+
     const contents = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
     defer allocator.free(contents);
 
     return parseSlice(allocator, contents, .{ .check_startup_script_paths = true });
+}
+
+pub fn resolveConfigPath(
+    allocator: std.mem.Allocator,
+    path_override: ?[]const u8,
+) ![]u8 {
+    if (path_override) |path| {
+        return paths.expandUserPath(allocator, path);
+    }
+
+    const env_path = try rawEnvConfigPath(allocator);
+    defer if (env_path) |path| allocator.free(path);
+    if (env_path) |path| {
+        if (path.len > 0) {
+            return selectConfigPath(allocator, env_path, false, "");
+        }
+    }
+
+    const local_config_exists = blk: {
+        std.fs.cwd().access(paths.defaultConfigPath(), .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => return err,
+        };
+        break :blk true;
+    };
+    if (local_config_exists) {
+        return selectConfigPath(allocator, env_path, true, "");
+    }
+
+    const user_path = try paths.defaultUserConfigPath(allocator);
+    defer allocator.free(user_path);
+
+    return selectConfigPath(allocator, env_path, false, user_path);
+}
+
+pub fn configLookupDescription(allocator: std.mem.Allocator) ![]u8 {
+    const user_path = try paths.defaultUserConfigPath(allocator);
+    defer allocator.free(user_path);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}, ./{s}, then {s}",
+        .{ config_env_var, paths.defaultConfigPath(), user_path },
+    );
+}
+
+fn rawEnvConfigPath(allocator: std.mem.Allocator) !?[]u8 {
+    const raw_path = std.process.getEnvVarOwned(allocator, config_env_var) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    };
+
+    return raw_path;
+}
+
+fn selectConfigPath(
+    allocator: std.mem.Allocator,
+    env_path: ?[]const u8,
+    local_config_exists: bool,
+    user_config_path: []const u8,
+) ![]u8 {
+    if (env_path) |path| {
+        if (path.len > 0) {
+            return paths.expandUserPath(allocator, path);
+        }
+    }
+
+    if (local_config_exists) {
+        return allocator.dupe(u8, paths.defaultConfigPath());
+    }
+
+    return allocator.dupe(u8, user_config_path);
 }
 
 pub fn parseSlice(
@@ -433,4 +509,60 @@ test "parse target without startup script" {
 
     const target = try resolveTarget(&parsed.value, "devbox");
     try std.testing.expect(target.startup_script == null);
+}
+
+test "config path selection prefers explicit environment path" {
+    const allocator = std.testing.allocator;
+
+    const selected = try selectConfigPath(
+        allocator,
+        "/tmp/rove/custom.json",
+        true,
+        "/home/example/.config/rove/rove.json",
+    );
+    defer allocator.free(selected);
+
+    try std.testing.expectEqualStrings("/tmp/rove/custom.json", selected);
+}
+
+test "config path selection ignores empty environment path" {
+    const allocator = std.testing.allocator;
+
+    const selected = try selectConfigPath(
+        allocator,
+        "",
+        true,
+        "/home/example/.config/rove/rove.json",
+    );
+    defer allocator.free(selected);
+
+    try std.testing.expectEqualStrings("rove.json", selected);
+}
+
+test "config path selection prefers local config before user config" {
+    const allocator = std.testing.allocator;
+
+    const selected = try selectConfigPath(
+        allocator,
+        null,
+        true,
+        "/home/example/.config/rove/rove.json",
+    );
+    defer allocator.free(selected);
+
+    try std.testing.expectEqualStrings("rove.json", selected);
+}
+
+test "config path selection falls back to user config" {
+    const allocator = std.testing.allocator;
+
+    const selected = try selectConfigPath(
+        allocator,
+        null,
+        false,
+        "/home/example/.config/rove/rove.json",
+    );
+    defer allocator.free(selected);
+
+    try std.testing.expectEqualStrings("/home/example/.config/rove/rove.json", selected);
 }

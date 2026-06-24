@@ -12,7 +12,7 @@ rove exec <name> -- <command>
 rove down <name>
 ```
 
-The provider can be Fly, Vast.ai, or a future backend. Rove keeps the same lifecycle and SSH experience while provider-specific details stay in `rove.json`.
+The provider can be Fly, Vast.ai, or a future backend. Rove keeps the same lifecycle and SSH experience while provider-specific details stay in local config.
 
 ## What Rove Owns
 
@@ -66,7 +66,7 @@ nix develop -c zig build test
 
 ## Core Concepts
 
-- `target`: a named machine definition in `rove.json`, such as `devbox` or `gpu-4090`
+- `target`: a named machine definition in Rove config, such as `devbox` or `gpu-4090`
 - `name`: a tracked machine instance name, such as `work`, `train`, or `gpu-east`
 - `provider`: the backend used by a target
 - `machine record`: the normalized state Rove stores locally and prints as JSON
@@ -75,21 +75,27 @@ Targets are reusable definitions. Names are individual machine instances created
 
 ## Quick Start
 
-Copy the example config and edit the provider settings:
+Copy the example config into either a repo-local config or your user config and
+edit the provider settings:
 
 ```bash
-cp rove.example.json rove.json
+mkdir -p ~/.config/rove
+cp rove.example.json ~/.config/rove/rove.json
 rove doctor
 rove up devbox --name work
 rove ssh work
 ```
 
-The checked-in `rove.json` is a repo-local development config. Treat `rove.example.json` as the public template.
+Rove looks for config in this order: `ROVE_CONFIG`, `./rove.json`, then
+`~/.config/rove/rove.json`. Real config files are local state and should not be
+tracked; `rove.example.json` is the public template.
 
-For personal machines, point `startup_script` at your dotfiles remote bootstrap. In this checkout layout that is:
+If a machine needs bootstrapping after SSH becomes reachable, set
+`startup_script` in your local config. Keep personal paths out of tracked
+templates.
 
 ```json
-"startup_script": "../dotfiles/bin/bootstrap-remote"
+"startup_script": "/path/to/bootstrap-remote"
 ```
 
 ## Commands
@@ -114,23 +120,23 @@ rove down <name> [--json]
 
 Fly targets are useful for CPU devboxes and long-lived base images.
 
-For the baked Mesh devbox path, repository ownership is intentionally split:
+For baked devbox images, repository ownership is intentionally split:
 
-- dotfiles owns the image build, staging the Mesh Linux binary, Fly publish wrapper, and image boot behavior.
+- The image repo owns the Dockerfile, build inputs, publish wrapper, and image boot behavior.
 - Rove owns machine launch, local machine state, and SSH reachability.
-- Mesh owns the control plane, peer validation, scan/status/grep, and tmux UX.
+- Higher-level tools own control plane behavior, session state, and developer UX.
 
-Rove should receive an immutable image ref from the dotfiles Fly publish wrapper
-and pin that exact ref in `rove.json` or another local config. Do not put Fly
+Rove should receive an immutable image ref from the image publish process and
+pin that exact ref in your local Rove config. Do not put Fly
 tokens, Tailscale auth keys, SSH private keys, or secret values in tracked files.
-Run the publish wrapper from the dotfiles repo, then pass its
+Run the publish wrapper from the image repo, then pass its
 `registry.fly.io/<fly-app>:<tag>@sha256:<digest>` output to Rove:
 
 ```bash
-./scripts/pin-image-ref.sh devbox 'registry.fly.io/<fly-app>:<tag>@sha256:<digest>' rove.json
+./scripts/pin-image-ref.sh devbox 'registry.fly.io/<fly-app>:<tag>@sha256:<digest>'
 ```
 
-Private Mesh devboxes should use Fly secrets as the source of truth for SSH keys
+Private Fly devboxes should use Fly secrets as the source of truth for SSH keys
 and Tailscale auth. Set the secrets out of band and store only their names in
 documentation:
 
@@ -244,8 +250,8 @@ Troubleshooting:
 - No Tailscale IP or DNS name: check the image boot logs from Fly, confirm the auth key is valid, and verify `TAILSCALE_HOSTNAME` rendered to the expected `mesh-<name>`.
 - Rove cannot SSH: confirm `tailscale status` shows the host, `nc -vz mesh-<name> 2222` succeeds, and the `AUTHORIZED_KEYS` secret includes Rove's public key.
 - Wrong image ref: run `rove doctor` and inspect the target image; repin to the digest emitted by the dotfiles publish wrapper.
-- Public ports accidentally configured: set `"ports": []` in the target and relaunch; omitted `ports` keeps Rove's legacy public SSH mapping.
-- Mesh peer validation fails: first prove `rove exec <name> -- hostname` works, then use Mesh-side diagnostics to inspect `meshd` state, listen address, and peer health.
+- Public ports accidentally configured: set `"ports": []` in the target and relaunch. Non-empty `ports` require `"allow_public_ports": true`.
+- Higher-level peer validation fails: first prove `rove exec <name> -- hostname` works, then use that tool's diagnostics to inspect runtime state and peer health.
 
 ## Vast.ai Targets
 
@@ -265,7 +271,7 @@ Example target using marketplace search:
   "name": "gpu-4090",
   "provider": "vast",
   "ssh_user": "root",
-  "startup_script": "../dotfiles/bin/bootstrap-remote",
+  "startup_script": "/path/to/bootstrap-remote",
   "vast": {
     "query": "gpu_name=RTX_4090 num_gpus=1 verified=true direct_port_count>=1 rentable=true",
     "image": "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime",

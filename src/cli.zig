@@ -357,7 +357,7 @@ pub fn printHelp(writer: anytype) !void {
         \\terminal session state, and distributed control belong above this layer.
         \\
         \\Defaults:
-        \\  config: ./rove.json
+        \\  config: ROVE_CONFIG, ./rove.json, ~/.config/rove/rove.json
         \\  state: ~/.rove/state.json
         \\
     );
@@ -708,18 +708,25 @@ fn handleDoctor(
 ) !void {
     try stdout.writeAll("CHECK\tSTATUS\tDETAILS\n");
 
+    const config_path = try config.resolveConfigPath(allocator, null);
+    defer allocator.free(config_path);
+
     var has_errors = false;
-    var loaded_config = config.load(allocator, null) catch |err| switch (err) {
+    var loaded_config = config.load(allocator, config_path) catch |err| switch (err) {
         error.FileNotFound => {
             has_errors = true;
-            try printDoctorRow(stdout, "config", "error", "missing rove.json");
+            const detail = try std.fmt.allocPrint(allocator, "missing {s}", .{config_path});
+            defer allocator.free(detail);
+            try printDoctorRow(stdout, "config", "error", detail);
             return error.HandledFailure;
         },
         else => return err,
     };
     defer loaded_config.deinit();
 
-    try printDoctorRow(stdout, "config", "ok", "loaded rove.json");
+    const loaded_detail = try std.fmt.allocPrint(allocator, "loaded {s}", .{config_path});
+    defer allocator.free(loaded_detail);
+    try printDoctorRow(stdout, "config", "ok", loaded_detail);
 
     const provider_count = @typeInfo(model.ProviderKind).@"enum".fields.len;
     var checked_providers = [_]bool{false} ** provider_count;
@@ -786,13 +793,19 @@ fn handleAdopt(
     var loaded_state = try state.loadOrEmpty(allocator, null);
     defer loaded_state.deinit();
 
-    var loaded_config = config.load(allocator, null) catch |err| switch (err) {
+    const config_path = try config.resolveConfigPath(allocator, null);
+    defer allocator.free(config_path);
+
+    var loaded_config = config.load(allocator, config_path) catch |err| switch (err) {
         error.FileNotFound => {
+            const lookup = try config.configLookupDescription(allocator);
+            defer allocator.free(lookup);
             try std.fmt.format(
                 stderr,
                 "[error] missing config file '{s}'\n" ++
-                    "[hint] create it before adopting a target\n",
-                .{paths.defaultConfigPath()},
+                    "[hint] create it before adopting a target\n" ++
+                    "[hint] lookup order: {s}\n",
+                .{ config_path, lookup },
             );
             return error.HandledFailure;
         },
@@ -806,7 +819,7 @@ fn handleAdopt(
                 stderr,
                 "[error] unknown target '{s}'\n" ++
                     "[hint] add it to {s}\n",
-                .{ command.target, paths.defaultConfigPath() },
+                .{ command.target, config_path },
             );
             return error.HandledFailure;
         },
@@ -954,13 +967,19 @@ fn handleRun(
         return error.HandledFailure;
     }
 
-    var loaded_config = config.load(allocator, null) catch |err| switch (err) {
+    const config_path = try config.resolveConfigPath(allocator, null);
+    defer allocator.free(config_path);
+
+    var loaded_config = config.load(allocator, config_path) catch |err| switch (err) {
         error.FileNotFound => {
+            const lookup = try config.configLookupDescription(allocator);
+            defer allocator.free(lookup);
             try std.fmt.format(
                 stderr,
                 "[error] missing config file '{s}'\n" ++
-                    "[hint] create it before running a target\n",
-                .{paths.defaultConfigPath()},
+                    "[hint] create it before running a target\n" ++
+                    "[hint] lookup order: {s}\n",
+                .{ config_path, lookup },
             );
             return error.HandledFailure;
         },
@@ -974,7 +993,7 @@ fn handleRun(
                 stderr,
                 "[error] unknown target '{s}'\n" ++
                     "[hint] add it to {s}\n",
-                .{ command.target, paths.defaultConfigPath() },
+                .{ command.target, config_path },
             );
             return error.HandledFailure;
         },

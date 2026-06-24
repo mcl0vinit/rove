@@ -24,12 +24,13 @@ Environment:
   ROVE_TARGET               Default target name
   ROVE_INSTANCE             Default instance name
   ROVE_BIN                  Default rove binary
+  ROVE_CONFIG               Config path. Default: ./rove.json or ~/.config/rove/rove.json
   FLY_BIN                   flyctl/fly binary override
   TAILSCALE_BIN             tailscale binary override
   ALLOW_PUBLIC_FLY_IPS=1    Warn instead of failing if the app has public IPs
 
-Run from a directory containing rove.json. The target should use the private
-Fly shape: ports=[], inject_authorized_keys=false, ssh_host, and ssh_port.
+The target should use the private Fly shape: ports=[],
+inject_authorized_keys=false, ssh_host, and ssh_port.
 EOF
 }
 
@@ -90,10 +91,24 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ ! -f rove.json ]]; then
-  printf '[private-smoke:error] missing rove.json in %s\n' "$PWD" >&2
+resolve_config_path() {
+  if [[ -n "${ROVE_CONFIG:-}" ]]; then
+    printf '%s\n' "${ROVE_CONFIG}"
+  elif [[ -f rove.json ]]; then
+    printf '%s\n' "rove.json"
+  elif [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+    printf '%s\n' "${XDG_CONFIG_HOME}/rove/rove.json"
+  else
+    printf '%s\n' "${HOME}/.config/rove/rove.json"
+  fi
+}
+
+config_path="$(resolve_config_path)"
+if [[ ! -f "${config_path}" ]]; then
+  printf '[private-smoke:error] missing config file: %s\n' "${config_path}" >&2
   exit 1
 fi
+export ROVE_CONFIG="${config_path}"
 
 if [[ -z "${rove_bin}" ]]; then
   if [[ -x ./zig-out/bin/rove ]]; then
@@ -124,9 +139,9 @@ require_command() {
 require_command jq
 require_command nc
 
-target_json="$(jq -c --arg target "$target" '.targets[] | select(.name == $target)' rove.json)"
+target_json="$(jq -c --arg target "$target" '.targets[] | select(.name == $target)' "${config_path}")"
 if [[ -z "${target_json}" ]]; then
-  printf '[private-smoke:error] target not found in rove.json: %s\n' "$target" >&2
+  printf '[private-smoke:error] target not found in %s: %s\n' "${config_path}" "$target" >&2
   exit 1
 fi
 
