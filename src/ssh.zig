@@ -95,7 +95,7 @@ fn runBatchCommandWithRecovery(
     remote_command: []const u8,
     allow_host_key_recovery: bool,
 ) !exec.Result {
-    if (machine.provider == .fly and machine.app != null) {
+    if (shouldUseFlyMachineCommand(machine)) {
         return runFlyMachineCommand(allocator, machine, remote_command);
     }
 
@@ -120,6 +120,19 @@ fn runBatchCommandWithRecovery(
     }
 
     return result;
+}
+
+fn shouldUseFlyMachineCommand(machine: model.MachineRecord) bool {
+    if (machine.provider != .fly) return false;
+    const app = machine.app orelse return false;
+    if (machine.ssh_port != 22) return false;
+    return isDefaultFlySshHost(app, machine.host);
+}
+
+fn isDefaultFlySshHost(app: []const u8, host: []const u8) bool {
+    const suffix = ".fly.dev";
+    if (host.len != app.len + suffix.len) return false;
+    return std.mem.startsWith(u8, host, app) and std.mem.endsWith(u8, host, suffix);
 }
 
 fn runFlyMachineCommand(
@@ -379,6 +392,38 @@ test "detect stale host key failures" {
     try std.testing.expect(isHostKeyMismatch("Host key verification failed.\n"));
     try std.testing.expect(isHostKeyMismatch("Offending ED25519 key in /tmp/known_hosts:1\n"));
     try std.testing.expect(!isHostKeyMismatch("Permission denied (publickey).\n"));
+}
+
+test "fly machine command is only used for default fly ssh endpoint" {
+    const machine = model.MachineRecord{
+        .name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+        .id = "machine-id",
+        .provider_scope = "devbox",
+        .app = "devbox",
+        .host = "devbox.fly.dev",
+        .ssh_port = 22,
+        .ssh_user = "rove",
+    };
+
+    try std.testing.expect(shouldUseFlyMachineCommand(machine));
+}
+
+test "private fly ssh endpoint uses direct openssh transport" {
+    const machine = model.MachineRecord{
+        .name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+        .id = "machine-id",
+        .provider_scope = "devbox",
+        .app = "devbox",
+        .host = "mesh-work",
+        .ssh_port = 2222,
+        .ssh_user = "rove",
+    };
+
+    try std.testing.expect(!shouldUseFlyMachineCommand(machine));
 }
 
 test "wrapped remote command uses non-login shell" {
