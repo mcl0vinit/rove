@@ -12,66 +12,27 @@ pub fn create(
     const machine_name = try generatedMachineName(allocator, request.instance_name);
     defer allocator.free(machine_name);
 
-    var args = std.ArrayListUnmanaged([]const u8){};
-    defer args.deinit(allocator);
-    var owned_arg_values = std.ArrayListUnmanaged([]u8){};
-    defer {
-        for (owned_arg_values.items) |value| allocator.free(value);
-        owned_arg_values.deinit(allocator);
-    }
-
-    try args.appendSlice(allocator, &.{
-        "flyctl",
-        "machine",
-        "run",
-        fly_config.image,
-        "--app",
-        fly_config.app,
-        "--detach",
-        "--name",
-        machine_name,
-        "--vm-size",
-        fly_config.vm_size,
-        "--metadata",
-    });
-
-    try appendPortArgs(allocator, &args, &owned_arg_values, fly_config);
-
-    const managed_metadata = try std.fmt.allocPrint(allocator, "rove_managed=true", .{});
-    defer allocator.free(managed_metadata);
-    try args.append(allocator, managed_metadata);
-
-    try args.append(allocator, "--metadata");
-    const target_metadata = try std.fmt.allocPrint(allocator, "rove_target={s}", .{request.target_name});
-    defer allocator.free(target_metadata);
-    try args.append(allocator, target_metadata);
-
-    try args.append(allocator, "--metadata");
-    const instance_metadata = try std.fmt.allocPrint(allocator, "rove_instance={s}", .{request.instance_name});
-    defer allocator.free(instance_metadata);
-    try args.append(allocator, instance_metadata);
-
-    try appendConfiguredEnv(allocator, &args, &owned_arg_values, fly_config, request.instance_name, machine_name);
-
     var managed_key: ?keys.ManagedKeyPair = null;
     defer if (managed_key) |key| key.deinit(allocator);
+    var authorized_key: ?[]const u8 = null;
     if (fly_config.inject_authorized_keys) {
-        const public_key = request.authorized_key orelse blk: {
+        authorized_key = request.authorized_key orelse blk: {
             managed_key = try keys.ensureManagedKeyPair(allocator);
             break :blk managed_key.?.public_key;
         };
-
-        try args.append(allocator, "--env");
-        const authorized_keys_env = try std.fmt.allocPrint(allocator, "ROVE_AUTHORIZED_KEYS={s}", .{public_key});
-        defer allocator.free(authorized_keys_env);
-        try args.append(allocator, authorized_keys_env);
     }
 
-    if (selectedRegion(fly_config)) |region| {
-        try args.appendSlice(allocator, &.{ "--region", region });
-    }
+    var launch_args = try buildMachineRunArgs(
+        allocator,
+        fly_config,
+        request.target_name,
+        request.instance_name,
+        machine_name,
+        authorized_key,
+    );
+    defer launch_args.deinit(allocator);
 
-    const run_result = try exec.run(allocator, args.items);
+    const run_result = try exec.run(allocator, launch_args.args.items);
     defer run_result.deinit(allocator);
 
     if (!run_result.succeeded()) {
@@ -162,6 +123,77 @@ const FoundMachine = struct {
         if (self.region) |region| allocator.free(region);
     }
 };
+
+const MachineRunArgs = struct {
+    args: std.ArrayListUnmanaged([]const u8) = .{},
+    owned_arg_values: std.ArrayListUnmanaged([]u8) = .{},
+
+    fn deinit(self: *MachineRunArgs, allocator: std.mem.Allocator) void {
+        self.args.deinit(allocator);
+        for (self.owned_arg_values.items) |value| allocator.free(value);
+        self.owned_arg_values.deinit(allocator);
+        self.* = .{};
+    }
+};
+
+fn buildMachineRunArgs(
+    allocator: std.mem.Allocator,
+    fly_config: model.FlyTargetConfig,
+    target_name: []const u8,
+    instance_name: []const u8,
+    machine_name: []const u8,
+    authorized_key: ?[]const u8,
+) !MachineRunArgs {
+    var run_args = MachineRunArgs{};
+    errdefer run_args.deinit(allocator);
+
+    try run_args.args.appendSlice(allocator, &.{
+        "flyctl",
+        "machine",
+        "run",
+        fly_config.image,
+        "--app",
+        fly_config.app,
+        "--detach",
+        "--name",
+        machine_name,
+        "--vm-size",
+        fly_config.vm_size,
+    });
+
+    try appendMetadataArg(allocator, &run_args, "rove_managed", "true");
+    try appendMetadataArg(allocator, &run_args, "rove_target", target_name);
+    try appendMetadataArg(allocator, &run_args, "rove_instance", instance_name);
+
+    try appendPortArgs(allocator, &run_args.args, &run_args.owned_arg_values, fly_config);
+    try appendConfiguredEnv(allocator, &run_args.args, &run_args.owned_arg_values, fly_config, instance_name, machine_name);
+
+    if (fly_config.inject_authorized_keys) {
+        const public_key = authorized_key orelse return error.MissingAuthorizedKey;
+        try run_args.args.append(allocator, "--env");
+        const authorized_keys_env = try std.fmt.allocPrint(allocator, "ROVE_AUTHORIZED_KEYS={s}", .{public_key});
+        try run_args.owned_arg_values.append(allocator, authorized_keys_env);
+        try run_args.args.append(allocator, authorized_keys_env);
+    }
+
+    if (selectedRegion(fly_config)) |region| {
+        try run_args.args.appendSlice(allocator, &.{ "--region", region });
+    }
+
+    return run_args;
+}
+
+fn appendMetadataArg(
+    allocator: std.mem.Allocator,
+    run_args: *MachineRunArgs,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    try run_args.args.append(allocator, "--metadata");
+    const rendered = try std.fmt.allocPrint(allocator, "{s}={s}", .{ key, value });
+    try run_args.owned_arg_values.append(allocator, rendered);
+    try run_args.args.append(allocator, rendered);
+}
 
 fn generatedMachineName(
     allocator: std.mem.Allocator,
@@ -490,6 +522,112 @@ test "render fly launch templates" {
     try std.testing.expectEqualStrings("mesh-work-rove-work-1234-devbox", rendered);
 }
 
+test "default fly machine run args preserve public ssh launch path" {
+    const allocator = std.testing.allocator;
+    var run_args = try buildMachineRunArgs(
+        allocator,
+        .{
+            .app = "devbox",
+            .image = "registry.fly.io/devbox:latest",
+            .vm_size = "shared-cpu-2x",
+        },
+        "devbox",
+        "work",
+        "rove-work-1234",
+        "ssh-ed25519 AAAATEST rove-test",
+    );
+    defer run_args.deinit(allocator);
+
+    const expected = [_][]const u8{
+        "flyctl",
+        "machine",
+        "run",
+        "registry.fly.io/devbox:latest",
+        "--app",
+        "devbox",
+        "--detach",
+        "--name",
+        "rove-work-1234",
+        "--vm-size",
+        "shared-cpu-2x",
+        "--metadata",
+        "rove_managed=true",
+        "--metadata",
+        "rove_target=devbox",
+        "--metadata",
+        "rove_instance=work",
+        "--port",
+        "22:2222/tcp",
+        "--env",
+        "ROVE_AUTHORIZED_KEYS=ssh-ed25519 AAAATEST rove-test",
+    };
+    try expectArgsEqual(expected[0..], run_args.args.items);
+}
+
+test "private fly machine run args omit public ssh and render env" {
+    const allocator = std.testing.allocator;
+    var parsed_env = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{
+        \\  "TAILSCALE_HOSTNAME": "mesh-{name}",
+        \\  "TAILSCALE_SERVE_SSH": "1"
+        \\}
+    , .{ .allocate = .alloc_always });
+    defer parsed_env.deinit();
+
+    const fly_config = model.FlyTargetConfig{
+        .app = "devbox",
+        .image = "registry.fly.io/devbox:latest",
+        .vm_size = "shared-cpu-2x",
+        .ports = &.{},
+        .env = parsed_env.value,
+        .inject_authorized_keys = false,
+        .ssh_host = "mesh-{name}",
+        .ssh_port = 2222,
+    };
+
+    var run_args = try buildMachineRunArgs(
+        allocator,
+        fly_config,
+        "devbox",
+        "work",
+        "rove-work-1234",
+        null,
+    );
+    defer run_args.deinit(allocator);
+
+    const expected = [_][]const u8{
+        "flyctl",
+        "machine",
+        "run",
+        "registry.fly.io/devbox:latest",
+        "--app",
+        "devbox",
+        "--detach",
+        "--name",
+        "rove-work-1234",
+        "--vm-size",
+        "shared-cpu-2x",
+        "--metadata",
+        "rove_managed=true",
+        "--metadata",
+        "rove_target=devbox",
+        "--metadata",
+        "rove_instance=work",
+        "--env",
+        "TAILSCALE_HOSTNAME=mesh-work",
+        "--env",
+        "TAILSCALE_SERVE_SSH=1",
+    };
+    try expectArgsEqual(expected[0..], run_args.args.items);
+    try expectArgAbsent(run_args.args.items, "--port");
+    try expectArgPrefixAbsent(run_args.args.items, "ROVE_AUTHORIZED_KEYS=");
+
+    const host = try renderSshHost(allocator, fly_config, "work", "rove-work-1234");
+    defer allocator.free(host);
+    try std.testing.expectEqualStrings("mesh-work", host);
+    try std.testing.expectEqual(@as(u16, 2222), sshPortForConfig(fly_config));
+}
+
 test "empty configured ports emit no fly public port args" {
     const allocator = std.testing.allocator;
     var args = std.ArrayListUnmanaged([]const u8){};
@@ -579,4 +717,23 @@ test "listed machine parsing ignores extra fly fields" {
     try std.testing.expect(found != null);
     try std.testing.expectEqualStrings("123", found.?.id.?);
     try std.testing.expectEqualStrings("iad", found.?.region.?);
+}
+
+fn expectArgsEqual(expected: []const []const u8, actual: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |expected_arg, actual_arg| {
+        try std.testing.expectEqualStrings(expected_arg, actual_arg);
+    }
+}
+
+fn expectArgAbsent(args: []const []const u8, needle: []const u8) !void {
+    for (args) |arg| {
+        try std.testing.expect(!std.mem.eql(u8, arg, needle));
+    }
+}
+
+fn expectArgPrefixAbsent(args: []const []const u8, prefix: []const u8) !void {
+    for (args) |arg| {
+        try std.testing.expect(!std.mem.startsWith(u8, arg, prefix));
+    }
 }
