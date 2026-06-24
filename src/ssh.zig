@@ -318,6 +318,8 @@ fn appendOpenSshOptions(
     }
 
     try args.appendSlice(allocator, &.{
+        "-F",
+        "/dev/null",
         "-i",
         connection.identity_file,
         "-o",
@@ -424,6 +426,23 @@ test "private fly ssh endpoint uses direct openssh transport" {
     };
 
     try std.testing.expect(!shouldUseFlyMachineCommand(machine));
+}
+
+test "openssh args ignore user ssh config" {
+    const allocator = std.testing.allocator;
+    var args = std.ArrayListUnmanaged([]const u8){};
+    defer args.deinit(allocator);
+
+    try appendOpenSshOptions(allocator, &args, .{
+        .destination = "rove@mesh-work",
+        .user_known_hosts = "UserKnownHostsFile=/tmp/known_hosts",
+        .host_key_alias = "HostKeyAlias=machine-id",
+        .port_option = "Port=2222",
+        .identity_file = "/tmp/id_ed25519",
+    }, true, true);
+
+    try std.testing.expectEqualStrings("-F", args.items[0]);
+    try std.testing.expectEqualStrings("/dev/null", args.items[1]);
 }
 
 test "wrapped remote command uses non-login shell" {
