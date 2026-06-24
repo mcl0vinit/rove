@@ -4,10 +4,9 @@
       "name": "devbox",
       "provider": "fly",
       "ssh_user": "rove",
-      "startup_script": "./scripts/bootstrap.sh",
       "fly": {
         "app": "your-fly-app",
-        "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
+        "image": "registry.fly.io/your-fly-app:deployment-<id>@sha256:<digest>",
         "vm_size": "shared-cpu-2x",
         "ports": [],
         "inject_authorized_keys": false,

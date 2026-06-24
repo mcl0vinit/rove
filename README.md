@@ -114,29 +114,42 @@ rove down <name> [--json]
 
 Fly targets are useful for CPU devboxes and long-lived base images.
 
-Rove does not own the devbox image build or publish path. Build and publish the
-image from the dotfiles-owned image project, for example:
+For the baked Mesh devbox path, repository ownership is intentionally split:
 
-- `~/Documents/Code/dotfiles/images/mesh-devbox`
-- `~/Documents/Code/dotfiles/deploy/fly/mesh-devbox`
+- dotfiles owns the image build, staging the Mesh Linux binary, Fly publish wrapper, and image boot behavior.
+- Rove owns machine launch, local machine state, and SSH reachability.
+- Mesh owns the control plane, peer validation, scan/status/grep, and tmux UX.
 
-Then pin the resulting image digest in the Rove target config:
+Rove should receive an immutable image ref from the dotfiles Fly publish wrapper
+and pin that exact ref in `rove.json` or another local config. Do not put Fly
+tokens, Tailscale auth keys, SSH private keys, or secret values in tracked files.
+Run the publish wrapper from the dotfiles repo, then pass its
+`registry.fly.io/<fly-app>:<tag>@sha256:<digest>` output to Rove:
 
 ```bash
-./scripts/pin-image-ref.sh devbox 'registry.fly.io/your-fly-app:latest@sha256:<digest>'
+./scripts/pin-image-ref.sh devbox 'registry.fly.io/<fly-app>:<tag>@sha256:<digest>' rove.json
 ```
 
-Example target:
+Private Mesh devboxes should use Fly secrets as the source of truth for SSH keys
+and Tailscale auth. Set the secrets out of band and store only their names in
+documentation:
+
+```bash
+flyctl secrets set --app <fly-app> \
+  AUTHORIZED_KEYS='<public ssh keys only>' \
+  MESH_TAILSCALE_AUTHKEY='<tailscale auth key>'
+```
+
+Example private target:
 
 ```json
 {
   "name": "devbox",
   "provider": "fly",
   "ssh_user": "rove",
-  "startup_script": "../dotfiles/bin/bootstrap-remote",
   "fly": {
     "app": "your-fly-app",
-    "image": "registry.fly.io/your-fly-app:latest@sha256:<digest>",
+    "image": "registry.fly.io/your-fly-app:deployment-<id>@sha256:<digest>",
     "vm_size": "shared-cpu-2x",
     "ports": [],
     "inject_authorized_keys": false,
@@ -163,9 +176,35 @@ Fly fields:
 - `ssh_port`: optional SSH port stored in Rove state after launch.
 
 Target fields:
-- `ssh_identity_file`: optional private key path for Rove's SSH operations. Omit it to use Rove's managed key; if `inject_authorized_keys` is `false`, make sure the provider/app secret contains the matching public key.
+- `ssh_identity_file`: optional private key path for Rove's SSH operations. Omit it to use Rove's managed key; if `inject_authorized_keys` is `false`, make sure the `AUTHORIZED_KEYS` Fly secret contains the matching public key.
+- `startup_script`: optional post-SSH bootstrap. The baked Mesh devbox image should not need this for `mesh` or `meshd`; dotfiles image boot owns that setup.
 
 Legacy top-level Fly fields are still accepted for older configs, but new configs should use the nested `fly` block.
+
+### Private Mesh Devbox Loop
+
+After publishing and pinning the image, launch through Rove:
+
+```bash
+rove doctor
+rove up devbox --name work
+rove inspect work --json
+```
+
+Verify that Rove reaches the machine over Tailscale Serve SSH, not public Fly
+ingress:
+
+```bash
+tailscale status | grep 'mesh-work'
+rove exec work -- hostname
+flyctl machine list --app <fly-app>
+flyctl ips list --app <fly-app>
+```
+
+For private-only targets, the machine should have no Fly services from Rove's
+launch args and the app should not need public ingress IPs for Rove SSH. Mesh
+validation happens from the Mesh repo or CLI after Rove can inspect and SSH to
+the machine.
 
 ### Private Fly Smoke Test
 
@@ -196,9 +235,13 @@ Fly may report app secrets as `Staged` when using `fly machine run` without an
 app release. A newly created Machine still receives staged secrets at boot; use
 the smoke helper to prove the actual runtime path.
 
-If `mesh-{name}` does not resolve locally, confirm the node appears in
-`tailscale status` and retry from the same shell used for Rove. You can also use
-the full tailnet DNS name from `tailscale status` while debugging.
+Troubleshooting:
+- Missing secrets: confirm `flyctl secrets list --app <fly-app>` includes `AUTHORIZED_KEYS` and `MESH_TAILSCALE_AUTHKEY`; do not print secret values.
+- No Tailscale IP or DNS name: check the image boot logs from Fly, confirm the auth key is valid, and verify `TAILSCALE_HOSTNAME` rendered to the expected `mesh-<name>`.
+- Rove cannot SSH: confirm `tailscale status` shows the host, `nc -vz mesh-<name> 2222` succeeds, and the `AUTHORIZED_KEYS` secret includes Rove's public key.
+- Wrong image ref: run `rove doctor` and inspect the target image; repin to the digest emitted by the dotfiles publish wrapper.
+- Public ports accidentally configured: set `"ports": []` in the target and relaunch; omitted `ports` keeps Rove's legacy public SSH mapping.
+- Mesh peer validation fails: first prove `rove exec <name> -- hostname` works, then use Mesh-side diagnostics to inspect `meshd` state, listen address, and peer health.
 
 ## Vast.ai Targets
 
