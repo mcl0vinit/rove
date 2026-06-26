@@ -19,6 +19,9 @@ pub const Error = std.fs.File.OpenError ||
         MissingRegionPreference,
         InvalidFlyEnv,
         InvalidFlyPort,
+        EmptyReadinessCommand,
+        InvalidReadinessTimeout,
+        InvalidReadinessPollInterval,
         PublicFlyPortsRequireOptIn,
         InvalidSshPort,
         PrivateSshRequiresPrivateResolver,
@@ -184,6 +187,15 @@ fn validate(
         if (target.ssh_user.len == 0) return error.MissingSshUser;
         if (target.require_private_ssh and target.ssh_resolver != .tailscale) {
             return error.PrivateSshRequiresPrivateResolver;
+        }
+        if (target.readiness_command) |readiness_command| {
+            if (readiness_command.len == 0) return error.EmptyReadinessCommand;
+        }
+        if (target.readiness_timeout_ms) |timeout_ms| {
+            if (timeout_ms == 0) return error.InvalidReadinessTimeout;
+        }
+        if (target.readiness_poll_interval_ms) |poll_interval_ms| {
+            if (poll_interval_ms == 0) return error.InvalidReadinessPollInterval;
         }
 
         switch (target.provider) {
@@ -355,6 +367,119 @@ test "target ssh resolver defaults preserve system behavior" {
     const target = try resolveTarget(&parsed.value, "devbox");
     try std.testing.expectEqual(model.SshResolver.system, target.ssh_resolver);
     try std.testing.expect(!target.require_private_ssh);
+}
+
+test "parse generic readiness command config" {
+    const allocator = std.testing.allocator;
+    const contents =
+        \\{
+        \\  "targets": [
+        \\    {
+        \\      "name": "devbox",
+        \\      "provider": "fly",
+        \\      "ssh_user": "rove",
+        \\      "readiness_command": "test -f /tmp/app-ready",
+        \\      "readiness_timeout_ms": 60000,
+        \\      "readiness_poll_interval_ms": 1000,
+        \\      "fly": {
+        \\        "app": "devbox",
+        \\        "image": "registry.fly.io/devbox:latest",
+        \\        "vm_size": "shared-cpu-2x"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var parsed = try parseSlice(allocator, contents, ValidationOptions{
+        .check_startup_script_paths = false,
+    });
+    defer parsed.deinit();
+
+    const target = try resolveTarget(&parsed.value, "devbox");
+    try std.testing.expectEqualStrings("test -f /tmp/app-ready", target.readiness_command.?);
+    try std.testing.expectEqual(@as(u64, 60000), target.readiness_timeout_ms.?);
+    try std.testing.expectEqual(@as(u64, 1000), target.readiness_poll_interval_ms.?);
+}
+
+test "reject invalid generic readiness command config" {
+    const allocator = std.testing.allocator;
+    const empty_command =
+        \\{
+        \\  "targets": [
+        \\    {
+        \\      "name": "devbox",
+        \\      "provider": "fly",
+        \\      "ssh_user": "rove",
+        \\      "readiness_command": "",
+        \\      "fly": {
+        \\        "app": "devbox",
+        \\        "image": "registry.fly.io/devbox:latest",
+        \\        "vm_size": "shared-cpu-2x"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    try std.testing.expectError(
+        error.EmptyReadinessCommand,
+        parseSlice(allocator, empty_command, ValidationOptions{
+            .check_startup_script_paths = false,
+        }),
+    );
+
+    const zero_timeout =
+        \\{
+        \\  "targets": [
+        \\    {
+        \\      "name": "devbox",
+        \\      "provider": "fly",
+        \\      "ssh_user": "rove",
+        \\      "readiness_command": "true",
+        \\      "readiness_timeout_ms": 0,
+        \\      "fly": {
+        \\        "app": "devbox",
+        \\        "image": "registry.fly.io/devbox:latest",
+        \\        "vm_size": "shared-cpu-2x"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    try std.testing.expectError(
+        error.InvalidReadinessTimeout,
+        parseSlice(allocator, zero_timeout, ValidationOptions{
+            .check_startup_script_paths = false,
+        }),
+    );
+
+    const zero_poll =
+        \\{
+        \\  "targets": [
+        \\    {
+        \\      "name": "devbox",
+        \\      "provider": "fly",
+        \\      "ssh_user": "rove",
+        \\      "readiness_command": "true",
+        \\      "readiness_poll_interval_ms": 0,
+        \\      "fly": {
+        \\        "app": "devbox",
+        \\        "image": "registry.fly.io/devbox:latest",
+        \\        "vm_size": "shared-cpu-2x"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    try std.testing.expectError(
+        error.InvalidReadinessPollInterval,
+        parseSlice(allocator, zero_poll, ValidationOptions{
+            .check_startup_script_paths = false,
+        }),
+    );
 }
 
 test "reject private ssh without private resolver" {

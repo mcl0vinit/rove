@@ -20,9 +20,10 @@ Rove owns:
 - machine lifecycle: create, inspect, refresh, adopt, destroy
 - SSH reachability: managed keys, isolated known hosts, `ssh`, `exec`, file upload for bootstrap
 - optional bootstrap scripts after SSH becomes reachable
+- optional generic readiness commands after SSH/bootstrap
 - local machine state in `~/.rove/state.json`
 - provider reconciliation through `rove refresh` and `rove doctor`
-- script-friendly JSON output
+- script-friendly JSON output and launch progress events
 
 Rove does not own:
 - terminal session state
@@ -98,11 +99,27 @@ templates.
 "startup_script": "/path/to/bootstrap-remote"
 ```
 
+If a machine should not be marked ready until a generic remote check succeeds,
+set `readiness_command`. Rove runs it over SSH after SSH is reachable and after
+`startup_script`, if one is configured. The command is polled until it exits 0
+or the timeout expires.
+
+```json
+"readiness_command": "test -f /tmp/app-ready",
+"readiness_timeout_ms": 60000,
+"readiness_poll_interval_ms": 1000
+```
+
+Use `startup_script` for setup work. Use `readiness_command` for a readiness
+gate that should hold the machine in a non-ready state until the target image or
+application reports it is usable. Rove does not print readiness command output
+by default.
+
 ## Commands
 
 ```bash
-rove up <target> [--name <name>] [--json]
-rove run <target> [--name <name>] [--json]
+rove up <target> [--name <name>] [--json] [--progress-jsonl]
+rove run <target> [--name <name>] [--json] [--progress-jsonl]
 rove list [--json]
 rove status [name] [--json]
 rove inspect <name> [--json]
@@ -188,7 +205,10 @@ Target fields:
 - `ssh_identity_file`: optional private key path for Rove's SSH operations. Omit it to use Rove's managed key; if `inject_authorized_keys` is `false`, make sure the `AUTHORIZED_KEYS` Fly secret contains the matching public key.
 - `ssh_resolver`: optional SSH host resolver. Defaults to `system`, which preserves normal OpenSSH/provider behavior. Set to `tailscale` to resolve `ssh_host` with `tailscale ip -4 <host>` before SSH operations. `none` records that no resolver policy is being used.
 - `require_private_ssh`: optional guardrail, default `false`. When `true`, Rove requires a private resolver such as `tailscale` and fails closed instead of falling back to public/system SSH.
-- `startup_script`: optional post-SSH bootstrap. The baked Mesh devbox image should not need this for `mesh` or `meshd`; dotfiles image boot owns that setup.
+- `startup_script`: optional post-SSH bootstrap script path.
+- `readiness_command`: optional generic post-SSH command that must exit 0 before Rove marks the machine ready.
+- `readiness_timeout_ms`: optional readiness command timeout, default 180000.
+- `readiness_poll_interval_ms`: optional readiness command poll interval, default 2000.
 
 Legacy top-level Fly fields are still accepted for older configs, but new configs should use the nested `fly` block.
 
@@ -317,6 +337,27 @@ Vast fields:
 ## Script Contract
 
 Rove's script-facing API is JSON on stdout and errors or warnings on stderr.
+
+`rove up <target> --progress-jsonl` writes launch progress events as JSON Lines
+to stderr. This keeps stdout compatible with the existing human output and final
+`--json` machine document. Events use provider-neutral lifecycle phases:
+`launch`, `provider_create`, `ssh_wait`, `endpoint_resolution`, `ssh`,
+`bootstrap`, `readiness_command`, and `ready`.
+
+Each progress event includes stable fields:
+- `type`
+- `phase`
+- `status`
+- `elapsed_ms`
+- `instance_name`
+- `target_name`
+- `provider`
+- `machine_id`
+- `machine_name`
+- `ssh_configured_host`
+- `ssh_resolved_host`
+- `ssh_endpoint_host`
+- `ssh_port`
 
 The stable normalized SSH endpoint is:
 - `ssh_user`
