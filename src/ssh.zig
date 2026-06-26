@@ -9,6 +9,14 @@ pub const WaitOptions = struct {
     poll_interval_ms: u64 = 2 * std.time.ms_per_s,
 };
 
+pub const WaitResult = struct {
+    endpoint: ?EndpointMetadata = null,
+
+    pub fn deinit(self: WaitResult, allocator: std.mem.Allocator) void {
+        if (self.endpoint) |endpoint| endpoint.deinit(allocator);
+    }
+};
+
 const CommandRunner = *const fn (
     allocator: std.mem.Allocator,
     argv: []const []const u8,
@@ -42,6 +50,7 @@ pub const EndpointMetadata = struct {
 };
 
 const ConnectionParts = struct {
+    endpoint: ?EndpointMetadata = null,
     destination: []u8,
     user_known_hosts: []u8,
     host_key_alias: []u8,
@@ -49,6 +58,7 @@ const ConnectionParts = struct {
     identity_file: []u8,
 
     fn deinit(self: ConnectionParts, allocator: std.mem.Allocator) void {
+        if (self.endpoint) |endpoint| endpoint.deinit(allocator);
         allocator.free(self.destination);
         allocator.free(self.user_known_hosts);
         allocator.free(self.host_key_alias);
@@ -57,20 +67,39 @@ const ConnectionParts = struct {
     }
 };
 
+const BatchCommandResult = struct {
+    result: exec.Result,
+    endpoint: ?EndpointMetadata = null,
+
+    fn deinit(self: BatchCommandResult, allocator: std.mem.Allocator) void {
+        self.result.deinit(allocator);
+        if (self.endpoint) |endpoint| endpoint.deinit(allocator);
+    }
+};
+
 pub fn waitForReady(
     allocator: std.mem.Allocator,
     machine: model.MachineRecord,
     options: WaitOptions,
-) !void {
+) !WaitResult {
+    return waitForReadyWithRunner(allocator, machine, options, exec.run);
+}
+
+fn waitForReadyWithRunner(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    options: WaitOptions,
+    runner: CommandRunner,
+) !WaitResult {
     const deadline_ms = std.time.milliTimestamp() + @as(i64, @intCast(options.timeout_ms));
     var last_stderr: ?[]u8 = null;
     defer if (last_stderr) |stderr| allocator.free(stderr);
 
     while (true) {
-        const result = runBatchCommandWithRecovery(allocator, machine, "true", .{
+        var batch = runBatchCommandWithMetadataAndRunner(allocator, machine, "true", .{
             .allow_host_key_recovery = true,
             .emit_resolution_errors = false,
-        }) catch |err| switch (err) {
+        }, runner) catch |err| switch (err) {
             error.SshResolutionFailed => {
                 if (last_stderr) |stderr| allocator.free(stderr);
                 last_stderr = try std.fmt.allocPrint(
@@ -95,21 +124,23 @@ pub fn waitForReady(
             },
             else => return err,
         };
-        defer result.deinit(allocator);
+        defer batch.deinit(allocator);
 
-        if (result.succeeded()) {
-            return;
+        if (batch.result.succeeded()) {
+            const endpoint = batch.endpoint;
+            batch.endpoint = null;
+            return .{ .endpoint = endpoint };
         }
 
         if (last_stderr) |stderr| allocator.free(stderr);
-        last_stderr = if (result.stderr.len > 0)
-            try allocator.dupe(u8, result.stderr)
+        last_stderr = if (batch.result.stderr.len > 0)
+            try allocator.dupe(u8, batch.result.stderr)
         else
             null;
 
-        if (isFatalFailure(result.stderr)) {
-            if (result.stderr.len > 0) {
-                std.debug.print("[error] ssh authentication failed\n{s}", .{result.stderr});
+        if (isFatalFailure(batch.result.stderr)) {
+            if (batch.result.stderr.len > 0) {
+                std.debug.print("[error] ssh authentication failed\n{s}", .{batch.result.stderr});
             }
             return error.AuthenticationFailed;
         }
@@ -125,12 +156,53 @@ pub fn waitForReady(
     }
 }
 
+pub fn waitForCommand(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    remote_command: []const u8,
+    options: WaitOptions,
+) !void {
+    return waitForCommandWithRunner(allocator, machine, remote_command, options, exec.run);
+}
+
+fn waitForCommandWithRunner(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    remote_command: []const u8,
+    options: WaitOptions,
+    runner: CommandRunner,
+) !void {
+    const deadline_ms = std.time.milliTimestamp() + @as(i64, @intCast(options.timeout_ms));
+
+    while (true) {
+        const result = try runBatchCommandWithRecoveryAndRunner(allocator, machine, remote_command, .{
+            .allow_host_key_recovery = true,
+            .emit_resolution_errors = false,
+        }, runner);
+        defer result.deinit(allocator);
+
+        if (result.succeeded()) {
+            return;
+        }
+
+        if (isFatalFailure(result.stderr)) {
+            return error.AuthenticationFailed;
+        }
+
+        if (std.time.milliTimestamp() >= deadline_ms) {
+            return error.ReadinessCommandTimedOut;
+        }
+
+        std.Thread.sleep(options.poll_interval_ms * std.time.ns_per_ms);
+    }
+}
+
 pub fn runBatchCommand(
     allocator: std.mem.Allocator,
     machine: model.MachineRecord,
     remote_command: []const u8,
 ) !exec.Result {
-    return runBatchCommandWithRecovery(allocator, machine, remote_command, .{});
+    return runBatchCommandWithRecoveryAndRunner(allocator, machine, remote_command, .{}, exec.run);
 }
 
 pub fn preflight(
@@ -148,17 +220,32 @@ pub fn preflight(
     }
 }
 
-fn runBatchCommandWithRecovery(
+fn runBatchCommandWithRecoveryAndRunner(
     allocator: std.mem.Allocator,
     machine: model.MachineRecord,
     remote_command: []const u8,
     options: BatchCommandOptions,
+    runner: CommandRunner,
 ) !exec.Result {
+    const batch = try runBatchCommandWithMetadataAndRunner(allocator, machine, remote_command, options, runner);
+    if (batch.endpoint) |endpoint| endpoint.deinit(allocator);
+    return batch.result;
+}
+
+fn runBatchCommandWithMetadataAndRunner(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    remote_command: []const u8,
+    options: BatchCommandOptions,
+    runner: CommandRunner,
+) !BatchCommandResult {
     if (shouldUseFlyMachineCommand(machine)) {
-        return runFlyMachineCommand(allocator, machine, remote_command);
+        return .{
+            .result = try runFlyMachineCommandWithRunner(allocator, machine, remote_command, runner),
+        };
     }
 
-    const connection = prepareConnection(allocator, machine) catch |err| {
+    var connection = prepareConnectionWithRunner(allocator, machine, runner) catch |err| {
         if (options.emit_resolution_errors and isResolutionError(err)) {
             printResolutionFailure(machine, err);
         }
@@ -174,19 +261,24 @@ fn runBatchCommandWithRecovery(
     try appendCommonArgs(allocator, &args, connection, true, true);
     try args.appendSlice(allocator, &.{ "-T", connection.destination, wrapped_command });
 
-    var result = try exec.run(allocator, args.items);
+    var result = try runner(allocator, args.items);
     if (options.allow_host_key_recovery and !result.succeeded() and isHostKeyMismatch(result.stderr)) {
         result.deinit(allocator);
         if (try clearKnownHostAlias(allocator, machine)) {
             std.debug.print("[warn] cleared stale SSH host key for machine '{s}' and retried\n", .{machine.name});
         }
-        return runBatchCommandWithRecovery(allocator, machine, remote_command, .{
+        return runBatchCommandWithMetadataAndRunner(allocator, machine, remote_command, .{
             .allow_host_key_recovery = false,
             .emit_resolution_errors = options.emit_resolution_errors,
-        });
+        }, runner);
     }
 
-    return result;
+    const endpoint = connection.endpoint;
+    connection.endpoint = null;
+    return .{
+        .result = result,
+        .endpoint = endpoint,
+    };
 }
 
 fn shouldUseFlyMachineCommand(machine: model.MachineRecord) bool {
@@ -209,11 +301,20 @@ fn runFlyMachineCommand(
     machine: model.MachineRecord,
     remote_command: []const u8,
 ) !exec.Result {
+    return runFlyMachineCommandWithRunner(allocator, machine, remote_command, exec.run);
+}
+
+fn runFlyMachineCommandWithRunner(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    remote_command: []const u8,
+    runner: CommandRunner,
+) !exec.Result {
     const app = machine.app orelse machine.provider_scope orelse return error.MissingProviderScope;
     const wrapped_command = try wrappedRemoteCommand(allocator, remote_command);
     defer allocator.free(wrapped_command);
 
-    return exec.run(allocator, &.{
+    return runner(allocator, &.{
         "flyctl",
         "ssh",
         "console",
@@ -319,7 +420,7 @@ fn prepareConnectionWithRunner(
     runner: CommandRunner,
 ) !ConnectionParts {
     var endpoint = try resolveEndpointMetadataWithRunner(allocator, machine, runner, .prefer_existing);
-    defer endpoint.deinit(allocator);
+    errdefer endpoint.deinit(allocator);
 
     const known_hosts_path = try paths.defaultKnownHostsPath(allocator);
     errdefer allocator.free(known_hosts_path);
@@ -357,6 +458,7 @@ fn prepareConnectionWithRunner(
     errdefer allocator.free(identity_file);
 
     return .{
+        .endpoint = endpoint,
         .destination = destination,
         .user_known_hosts = user_known_hosts,
         .host_key_alias = host_key_alias,
@@ -673,6 +775,101 @@ test "tailscale resolver records configured and resolved hosts" {
     try std.testing.expectEqualStrings("100.64.1.2", endpoint.endpoint_host);
 }
 
+test "ssh readiness returns successful endpoint metadata" {
+    const allocator = std.testing.allocator;
+    const machine = model.MachineRecord{
+        .name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+        .id = "machine-id",
+        .host = "private-work",
+        .ssh_port = 2222,
+        .ssh_resolver = .tailscale,
+        .require_private_ssh = true,
+        .ssh_user = "rove",
+    };
+
+    const ready = try waitForReadyWithRunner(allocator, machine, .{
+        .timeout_ms = 0,
+        .poll_interval_ms = 1,
+    }, fakeReadyRunner);
+    defer ready.deinit(allocator);
+
+    try std.testing.expect(ready.endpoint != null);
+    try std.testing.expectEqualStrings("private-work", ready.endpoint.?.configured_host);
+    try std.testing.expectEqualStrings("100.64.1.2", ready.endpoint.?.resolved_host.?);
+    try std.testing.expectEqualStrings("100.64.1.2", ready.endpoint.?.endpoint_host);
+}
+
+test "ssh readiness fails closed when private resolver policy is invalid" {
+    const allocator = std.testing.allocator;
+    const machine = model.MachineRecord{
+        .name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+        .id = "machine-id",
+        .host = "private-work",
+        .ssh_port = 2222,
+        .require_private_ssh = true,
+        .ssh_user = "rove",
+    };
+
+    try std.testing.expectError(
+        error.PrivateSshRequiresPrivateResolver,
+        waitForReadyWithRunner(allocator, machine, .{
+            .timeout_ms = 0,
+            .poll_interval_ms = 1,
+        }, fakeReadyRunner),
+    );
+}
+
+test "generic readiness command succeeds through ssh" {
+    const allocator = std.testing.allocator;
+    const machine = model.MachineRecord{
+        .name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+        .id = "machine-id",
+        .host = "private-work",
+        .ssh_configured_host = "private-work",
+        .ssh_resolved_host = "100.64.1.2",
+        .ssh_port = 2222,
+        .ssh_resolver = .tailscale,
+        .require_private_ssh = true,
+        .ssh_user = "rove",
+    };
+
+    try waitForCommandWithRunner(allocator, machine, "test -f /tmp/app-ready", .{
+        .timeout_ms = 0,
+        .poll_interval_ms = 1,
+    }, fakeReadyRunner);
+}
+
+test "generic readiness command timeout does not print command output" {
+    const allocator = std.testing.allocator;
+    const machine = model.MachineRecord{
+        .name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+        .id = "machine-id",
+        .host = "private-work",
+        .ssh_configured_host = "private-work",
+        .ssh_resolved_host = "100.64.1.2",
+        .ssh_port = 2222,
+        .ssh_resolver = .tailscale,
+        .require_private_ssh = true,
+        .ssh_user = "rove",
+    };
+
+    try std.testing.expectError(
+        error.ReadinessCommandTimedOut,
+        waitForCommandWithRunner(allocator, machine, "test -f /tmp/app-ready", .{
+            .timeout_ms = 0,
+            .poll_interval_ms = 1,
+        }, fakeReadinessFailureRunner),
+    );
+}
+
 test "tailscale resolver command failure fails closed" {
     const allocator = std.testing.allocator;
     const machine = model.MachineRecord{
@@ -839,4 +1036,42 @@ fn fakeTailscaleFailure(
         .stdout = try allocator.dupe(u8, ""),
         .stderr = try allocator.dupe(u8, "no such host\n"),
     };
+}
+
+fn fakeReadyRunner(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) anyerror!exec.Result {
+    if (argv.len >= 4 and std.mem.eql(u8, argv[0], "tailscale")) {
+        return .{
+            .term = .{ .Exited = 0 },
+            .stdout = try allocator.dupe(u8, "100.64.1.2\n"),
+            .stderr = try allocator.dupe(u8, ""),
+        };
+    }
+
+    if (argv.len >= 1 and std.mem.eql(u8, argv[0], "ssh")) {
+        return .{
+            .term = .{ .Exited = 0 },
+            .stdout = try allocator.dupe(u8, ""),
+            .stderr = try allocator.dupe(u8, ""),
+        };
+    }
+
+    return error.UnexpectedCommand;
+}
+
+fn fakeReadinessFailureRunner(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) anyerror!exec.Result {
+    if (argv.len >= 1 and std.mem.eql(u8, argv[0], "ssh")) {
+        return .{
+            .term = .{ .Exited = 1 },
+            .stdout = try allocator.dupe(u8, "sensitive stdout\n"),
+            .stderr = try allocator.dupe(u8, "sensitive stderr\n"),
+        };
+    }
+
+    return fakeReadyRunner(allocator, argv);
 }

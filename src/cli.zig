@@ -31,6 +31,7 @@ pub const RunCommand = struct {
     target: []const u8,
     name: ?[]const u8 = null,
     format: OutputFormat = .human,
+    progress_jsonl: bool = false,
 };
 
 pub const StatusCommand = struct {
@@ -236,6 +237,13 @@ fn parseRunCommand(args: []const []const u8) ParseError!RunCommand {
             continue;
         }
 
+        if (std.mem.eql(u8, args[index], "--progress-jsonl")) {
+            if (command.progress_jsonl) return error.InvalidArguments;
+            command.progress_jsonl = true;
+            index += 1;
+            continue;
+        }
+
         return error.InvalidArguments;
     }
 
@@ -341,8 +349,8 @@ pub fn printHelp(writer: anytype) !void {
         \\rove
         \\
         \\Usage:
-        \\  rove up <target> [--name <name>] [--json]
-        \\  rove run <target> [--name <name>] [--json]
+        \\  rove up <target> [--name <name>] [--json] [--progress-jsonl]
+        \\  rove run <target> [--name <name>] [--json] [--progress-jsonl]
         \\  rove list [--json]
         \\  rove status [name] [--json]
         \\  rove inspect <name> [--json]
@@ -444,6 +452,98 @@ fn writeMachineJsonDocument(
     try appendMachineJson(&out, machine);
     try out.writer.writeAll("}\n");
     try stdout.writeAll(out.written());
+}
+
+const LaunchProgressContext = struct {
+    enabled: bool,
+    started_ms: i64,
+    instance_name: []const u8,
+    target_name: []const u8,
+    provider: model.ProviderKind,
+};
+
+fn renderLaunchProgressEvent(
+    allocator: std.mem.Allocator,
+    progress: LaunchProgressContext,
+    phase: []const u8,
+    status_name: []const u8,
+    machine: ?model.MachineRecord,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    const now_ms = std.time.milliTimestamp();
+    const elapsed_ms: u64 = if (now_ms <= progress.started_ms)
+        0
+    else
+        @intCast(now_ms - progress.started_ms);
+
+    try out.writer.writeAll("{\"type\":\"launch_progress\",\"phase\":");
+    try appendJsonString(&out, phase);
+    try out.writer.writeAll(",\"status\":");
+    try appendJsonString(&out, status_name);
+    try out.writer.writeAll(",\"elapsed_ms\":");
+    try std.json.Stringify.value(elapsed_ms, .{}, &out.writer);
+    try out.writer.writeAll(",\"instance_name\":");
+    try appendJsonString(&out, progress.instance_name);
+    try out.writer.writeAll(",\"target_name\":");
+    try appendJsonString(&out, progress.target_name);
+    try out.writer.writeAll(",\"provider\":");
+    try appendJsonString(&out, model.providerName(progress.provider));
+    try out.writer.writeAll(",\"machine_id\":");
+    if (machine) |value| {
+        try appendJsonString(&out, value.id);
+    } else {
+        try out.writer.writeAll("null");
+    }
+    try out.writer.writeAll(",\"machine_name\":");
+    if (machine) |value| {
+        try appendJsonNullableString(&out, value.machine_name);
+    } else {
+        try out.writer.writeAll("null");
+    }
+    try out.writer.writeAll(",\"ssh_configured_host\":");
+    if (machine) |value| {
+        try appendJsonString(&out, model.configuredSshHost(value));
+    } else {
+        try out.writer.writeAll("null");
+    }
+    try out.writer.writeAll(",\"ssh_resolved_host\":");
+    if (machine) |value| {
+        try appendJsonNullableString(&out, value.ssh_resolved_host);
+    } else {
+        try out.writer.writeAll("null");
+    }
+    try out.writer.writeAll(",\"ssh_endpoint_host\":");
+    if (machine) |value| {
+        try appendJsonString(&out, model.endpointSshHost(value));
+    } else {
+        try out.writer.writeAll("null");
+    }
+    try out.writer.writeAll(",\"ssh_port\":");
+    if (machine) |value| {
+        try std.json.Stringify.value(value.ssh_port, .{}, &out.writer);
+    } else {
+        try out.writer.writeAll("null");
+    }
+    try out.writer.writeAll("}\n");
+
+    return allocator.dupe(u8, out.written());
+}
+
+fn emitLaunchProgress(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    progress: LaunchProgressContext,
+    phase: []const u8,
+    status_name: []const u8,
+    machine: ?model.MachineRecord,
+) !void {
+    if (!progress.enabled) return;
+
+    const line = try renderLaunchProgressEvent(allocator, progress, phase, status_name, machine);
+    defer allocator.free(line);
+    try writer.writeAll(line);
 }
 
 fn appendRefreshResultJson(
@@ -975,6 +1075,7 @@ fn handleRun(
     stderr: anytype,
     command: RunCommand,
 ) !void {
+    const launch_started_ms = std.time.milliTimestamp();
     const instance_name = command.name orelse command.target;
     if (!isValidInstanceName(instance_name)) {
         try std.fmt.format(
@@ -1036,6 +1137,15 @@ fn handleRun(
     const summary = provider.targetSummary(target.*);
     const placement = try provider.renderPlacementSummary(allocator, target.*);
     defer allocator.free(placement);
+    const progress = LaunchProgressContext{
+        .enabled = command.progress_jsonl,
+        .started_ms = launch_started_ms,
+        .instance_name = instance_name,
+        .target_name = target.name,
+        .provider = target.provider,
+    };
+
+    try emitLaunchProgress(allocator, stderr, progress, "launch", "requested", null);
 
     var create_authorized_key: ?[]u8 = null;
     defer if (create_authorized_key) |authorized_key| allocator.free(authorized_key);
@@ -1045,12 +1155,14 @@ fn handleRun(
         create_authorized_key = try keys.publicKeyForPrivateKey(allocator, expanded_identity_file);
     }
 
+    try emitLaunchProgress(allocator, stderr, progress, "provider_create", "started", null);
     const created = provider.create(allocator, target.provider, .{
         .target_name = target.name,
         .provider_config = target_provider_config,
         .instance_name = instance_name,
         .authorized_key = create_authorized_key,
     }) catch |err| {
+        try emitLaunchProgress(allocator, stderr, progress, "provider_create", "failed", null);
         try std.fmt.format(
             stderr,
             "[error] failed to create target '{s}' via {s}: {s}\n",
@@ -1080,6 +1192,7 @@ fn handleRun(
     };
 
     try state.upsertMachine(allocator, machine, null);
+    try emitLaunchProgress(allocator, stderr, progress, "provider_create", "done", machine);
 
     if (command.format == .human) {
         try std.fmt.format(
@@ -1112,6 +1225,7 @@ fn handleRun(
 
     machine.status = .waiting_for_ssh;
     try state.upsertMachine(allocator, machine, null);
+    try emitLaunchProgress(allocator, stderr, progress, "ssh_wait", "started", machine);
 
     if (command.format == .human) {
         try std.fmt.format(
@@ -1121,9 +1235,10 @@ fn handleRun(
         );
     }
 
-    ssh.waitForReady(allocator, machine, .{}) catch |err| {
+    const ready = ssh.waitForReady(allocator, machine, .{}) catch |err| {
         machine.status = .provisioned_unreachable;
         try state.upsertMachine(allocator, machine, null);
+        try emitLaunchProgress(allocator, stderr, progress, "ssh_wait", "failed", machine);
 
         try std.fmt.format(
             stderr,
@@ -1133,35 +1248,23 @@ fn handleRun(
         );
         return error.HandledFailure;
     };
+    defer ready.deinit(allocator);
 
-    var resolved_machine = resolveMachineEndpointForUse(allocator, machine) catch |err| {
-        machine.status = .provisioned_unreachable;
+    if (ready.endpoint) |endpoint| {
+        endpoint.applyToMachine(&machine);
         try state.upsertMachine(allocator, machine, null);
-
-        try std.fmt.format(
-            stderr,
-            "[error] ssh resolver '{s}' failed for instance '{s}' host '{s}': {s}\n" ++
-                "[hint] inspect the machine with `rove status {s}` once private reachability works\n",
-            .{
-                model.sshResolverName(machine.ssh_resolver),
-                machine.name,
-                model.configuredSshHost(machine),
-                @errorName(err),
-                machine.name,
-            },
-        );
-        if (machine.require_private_ssh) {
-            try stderr.writeAll("[hint] private SSH is required; no system or public SSH fallback was attempted\n");
+        if (machine.ssh_resolved_host != null) {
+            try emitLaunchProgress(allocator, stderr, progress, "endpoint_resolution", "done", machine);
         }
-        return error.HandledFailure;
-    };
-    defer resolved_machine.deinit(allocator);
-    machine = resolved_machine.value;
+    }
+
+    try emitLaunchProgress(allocator, stderr, progress, "ssh", "ready", machine);
     try state.upsertMachine(allocator, machine, null);
 
     if (target.startup_script) |startup_script| {
         machine.status = .bootstrapping;
         try state.upsertMachine(allocator, machine, null);
+        try emitLaunchProgress(allocator, stderr, progress, "bootstrap", "started", machine);
 
         if (command.format == .human) {
             try std.fmt.format(
@@ -1175,6 +1278,7 @@ fn handleRun(
         bootstrap.run(allocator, machine, startup_script) catch |err| {
             machine.status = .bootstrap_failed;
             try state.upsertMachine(allocator, machine, null);
+            try emitLaunchProgress(allocator, stderr, progress, "bootstrap", "failed", machine);
 
             try std.fmt.format(
                 stderr,
@@ -1184,12 +1288,48 @@ fn handleRun(
             );
             return error.HandledFailure;
         };
+        try emitLaunchProgress(allocator, stderr, progress, "bootstrap", "done", machine);
     } else if (command.format == .human) {
         try stdout.writeAll("[info] SSH ready\n");
+        try emitLaunchProgress(allocator, stderr, progress, "bootstrap", "skipped", machine);
+    } else {
+        try emitLaunchProgress(allocator, stderr, progress, "bootstrap", "skipped", machine);
+    }
+
+    if (target.readiness_command) |readiness_command| {
+        machine.status = .checking_readiness;
+        try state.upsertMachine(allocator, machine, null);
+        try emitLaunchProgress(allocator, stderr, progress, "readiness_command", "started", machine);
+
+        if (command.format == .human) {
+            try stdout.writeAll("[info] waiting for readiness command\n");
+        }
+
+        ssh.waitForCommand(allocator, machine, readiness_command, readinessWaitOptions(target.*)) catch |err| {
+            machine.status = .readiness_failed;
+            try state.upsertMachine(allocator, machine, null);
+            try emitLaunchProgress(allocator, stderr, progress, "readiness_command", "failed", machine);
+
+            try std.fmt.format(
+                stderr,
+                "[error] readiness command did not succeed for instance '{s}': {s}\n" ++
+                    "[hint] the machine is still running; use `rove ssh {s}` to inspect it\n",
+                .{ machine.name, @errorName(err), machine.name },
+            );
+            return error.HandledFailure;
+        };
+
+        if (command.format == .human) {
+            try stdout.writeAll("[info] readiness command succeeded\n");
+        }
+        try emitLaunchProgress(allocator, stderr, progress, "readiness_command", "done", machine);
+    } else {
+        try emitLaunchProgress(allocator, stderr, progress, "readiness_command", "skipped", machine);
     }
 
     machine.status = .ready;
     try state.upsertMachine(allocator, machine, null);
+    try emitLaunchProgress(allocator, stderr, progress, "ready", "done", machine);
 
     if (command.format == .json) {
         try writeMachineJsonDocument(allocator, stdout, machine);
@@ -1416,6 +1556,13 @@ fn renderRemoteCommand(
     }
 
     return allocator.dupe(u8, writer.written());
+}
+
+fn readinessWaitOptions(target: model.TargetConfig) ssh.WaitOptions {
+    return .{
+        .timeout_ms = target.readiness_timeout_ms orelse 180 * std.time.ms_per_s,
+        .poll_interval_ms = target.readiness_poll_interval_ms orelse 2 * std.time.ms_per_s,
+    };
 }
 
 const RefreshedMachine = struct {
@@ -1731,6 +1878,9 @@ fn lifecycleFromRemoteState(
         std.ascii.eqlIgnoreCase(value, "running") or
         std.ascii.eqlIgnoreCase(value, "frozen"))
     {
+        if (fallback == .checking_readiness or fallback == .readiness_failed) {
+            return fallback;
+        }
         return .ready;
     }
 
@@ -1760,6 +1910,25 @@ fn lifecycleFromRemoteState(
     return fallback;
 }
 
+test "remote running states preserve readiness lifecycle during refresh" {
+    const running_states = [_][]const u8{ "started", "running", "frozen" };
+
+    for (running_states) |remote_state| {
+        try std.testing.expectEqual(
+            model.LifecycleStatus.checking_readiness,
+            lifecycleFromRemoteState(remote_state, .checking_readiness),
+        );
+        try std.testing.expectEqual(
+            model.LifecycleStatus.readiness_failed,
+            lifecycleFromRemoteState(remote_state, .readiness_failed),
+        );
+        try std.testing.expectEqual(
+            model.LifecycleStatus.ready,
+            lifecycleFromRemoteState(remote_state, .provisioned),
+        );
+    }
+}
+
 fn isValidInstanceName(name: []const u8) bool {
     if (name.len == 0) return false;
 
@@ -1772,16 +1941,24 @@ fn isValidInstanceName(name: []const u8) bool {
 }
 
 test "parse up target with explicit name and json" {
-    const command = try parse(&.{ "up", "devbox", "--json", "--name", "work" });
+    const command = try parse(&.{ "up", "devbox", "--json", "--name", "work", "--progress-jsonl" });
 
     switch (command) {
         .up => |run_command| {
             try std.testing.expectEqualStrings("devbox", run_command.target);
             try std.testing.expectEqualStrings("work", run_command.name.?);
             try std.testing.expectEqual(OutputFormat.json, run_command.format);
+            try std.testing.expect(run_command.progress_jsonl);
         },
         else => return error.InvalidArguments,
     }
+}
+
+test "reject duplicate launch progress flag" {
+    try std.testing.expectError(
+        error.InvalidArguments,
+        parse(&.{ "up", "devbox", "--progress-jsonl", "--progress-jsonl" }),
+    );
 }
 
 test "parse run alias" {
@@ -1875,4 +2052,49 @@ test "render remote command quotes argv" {
     defer allocator.free(rendered);
 
     try std.testing.expectEqualStrings("'sh' '-lc' 'echo hello && pwd'", rendered);
+}
+
+test "render launch progress event json line" {
+    const allocator = std.testing.allocator;
+    const progress = LaunchProgressContext{
+        .enabled = true,
+        .started_ms = std.time.milliTimestamp(),
+        .instance_name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+    };
+    const machine = model.MachineRecord{
+        .name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+        .id = "machine-id",
+        .machine_name = "rove-work-1234",
+        .host = "private-work",
+        .ssh_configured_host = "private-work",
+        .ssh_resolved_host = "100.64.1.2",
+        .ssh_port = 2222,
+        .ssh_resolver = .tailscale,
+        .require_private_ssh = true,
+        .ssh_user = "rove",
+        .status = .waiting_for_ssh,
+    };
+
+    const line = try renderLaunchProgressEvent(allocator, progress, "endpoint_resolution", "done", machine);
+    defer allocator.free(line);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+
+    try std.testing.expectEqualStrings("launch_progress", object.get("type").?.string);
+    try std.testing.expectEqualStrings("endpoint_resolution", object.get("phase").?.string);
+    try std.testing.expectEqualStrings("done", object.get("status").?.string);
+    try std.testing.expectEqualStrings("work", object.get("instance_name").?.string);
+    try std.testing.expectEqualStrings("devbox", object.get("target_name").?.string);
+    try std.testing.expectEqualStrings("fly", object.get("provider").?.string);
+    try std.testing.expectEqualStrings("machine-id", object.get("machine_id").?.string);
+    try std.testing.expectEqualStrings("private-work", object.get("ssh_configured_host").?.string);
+    try std.testing.expectEqualStrings("100.64.1.2", object.get("ssh_resolved_host").?.string);
+    try std.testing.expectEqualStrings("100.64.1.2", object.get("ssh_endpoint_host").?.string);
+    try std.testing.expectEqual(@as(i64, 2222), object.get("ssh_port").?.integer);
 }

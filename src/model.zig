@@ -22,8 +22,10 @@ pub const LifecycleStatus = enum {
     provisioned,
     waiting_for_ssh,
     bootstrapping,
+    checking_readiness,
     ready,
     bootstrap_failed,
+    readiness_failed,
     provisioned_unreachable,
     destroying,
 };
@@ -72,6 +74,9 @@ pub const TargetConfig = struct {
     require_private_ssh: bool = false,
     ssh_identity_file: ?[]const u8 = null,
     startup_script: ?[]const u8 = null,
+    readiness_command: ?[]const u8 = null,
+    readiness_timeout_ms: ?u64 = null,
+    readiness_poll_interval_ms: ?u64 = null,
     fly: ?FlyTargetConfig = null,
     vast: ?VastTargetConfig = null,
 };
