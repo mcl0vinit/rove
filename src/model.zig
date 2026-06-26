@@ -5,6 +5,12 @@ pub const ProviderKind = enum {
     vast,
 };
 
+pub const SshResolver = enum {
+    system,
+    tailscale,
+    none,
+};
+
 pub const FlyPortConfig = struct {
     external: u16,
     internal: u16,
@@ -62,6 +68,8 @@ pub const TargetConfig = struct {
     region: ?[]const u8 = null,
     region_preference: ?[]const []const u8 = null,
     ssh_user: []const u8,
+    ssh_resolver: SshResolver = .system,
+    require_private_ssh: bool = false,
     ssh_identity_file: ?[]const u8 = null,
     startup_script: ?[]const u8 = null,
     fly: ?FlyTargetConfig = null,
@@ -81,7 +89,11 @@ pub const MachineRecord = struct {
     provider_scope: ?[]const u8 = null,
     app: ?[]const u8 = null,
     host: []const u8,
+    ssh_configured_host: ?[]const u8 = null,
+    ssh_resolved_host: ?[]const u8 = null,
     ssh_port: u16 = 22,
+    ssh_resolver: SshResolver = .system,
+    require_private_ssh: bool = false,
     ssh_identity_file: ?[]const u8 = null,
     region: ?[]const u8 = null,
     remote_state: ?[]const u8 = null,
@@ -98,6 +110,18 @@ pub fn providerName(provider: ProviderKind) []const u8 {
     return @tagName(provider);
 }
 
+pub fn sshResolverName(resolver: SshResolver) []const u8 {
+    return @tagName(resolver);
+}
+
 pub fn statusName(status: LifecycleStatus) []const u8 {
     return @tagName(status);
+}
+
+pub fn configuredSshHost(machine: MachineRecord) []const u8 {
+    return machine.ssh_configured_host orelse machine.host;
+}
+
+pub fn endpointSshHost(machine: MachineRecord) []const u8 {
+    return machine.ssh_resolved_host orelse configuredSshHost(machine);
 }

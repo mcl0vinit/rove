@@ -9,6 +9,38 @@ pub const WaitOptions = struct {
     poll_interval_ms: u64 = 2 * std.time.ms_per_s,
 };
 
+const CommandRunner = *const fn (
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) anyerror!exec.Result;
+
+const BatchCommandOptions = struct {
+    allow_host_key_recovery: bool = true,
+    emit_resolution_errors: bool = true,
+};
+
+const EndpointResolutionMode = enum {
+    refresh,
+    prefer_existing,
+};
+
+pub const EndpointMetadata = struct {
+    configured_host: []u8,
+    resolved_host: ?[]u8 = null,
+    endpoint_host: []const u8,
+    resolver: model.SshResolver,
+
+    pub fn deinit(self: EndpointMetadata, allocator: std.mem.Allocator) void {
+        allocator.free(self.configured_host);
+        if (self.resolved_host) |resolved_host| allocator.free(resolved_host);
+    }
+
+    pub fn applyToMachine(self: EndpointMetadata, machine: *model.MachineRecord) void {
+        machine.ssh_configured_host = self.configured_host;
+        machine.ssh_resolved_host = self.resolved_host;
+    }
+};
+
 const ConnectionParts = struct {
     destination: []u8,
     user_known_hosts: []u8,
@@ -35,7 +67,34 @@ pub fn waitForReady(
     defer if (last_stderr) |stderr| allocator.free(stderr);
 
     while (true) {
-        const result = try runBatchCommand(allocator, machine, "true");
+        const result = runBatchCommandWithRecovery(allocator, machine, "true", .{
+            .allow_host_key_recovery = true,
+            .emit_resolution_errors = false,
+        }) catch |err| switch (err) {
+            error.SshResolutionFailed => {
+                if (last_stderr) |stderr| allocator.free(stderr);
+                last_stderr = try std.fmt.allocPrint(
+                    allocator,
+                    "ssh resolver '{s}' did not resolve host '{s}': {s}\n",
+                    .{
+                        model.sshResolverName(machine.ssh_resolver),
+                        model.configuredSshHost(machine),
+                        @errorName(err),
+                    },
+                );
+
+                if (std.time.milliTimestamp() >= deadline_ms) {
+                    if (last_stderr) |stderr| {
+                        std.debug.print("[error] ssh did not become reachable before timeout\n{s}", .{stderr});
+                    }
+                    return err;
+                }
+
+                std.Thread.sleep(options.poll_interval_ms * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
         defer result.deinit(allocator);
 
         if (result.succeeded()) {
@@ -71,7 +130,7 @@ pub fn runBatchCommand(
     machine: model.MachineRecord,
     remote_command: []const u8,
 ) !exec.Result {
-    return runBatchCommandWithRecovery(allocator, machine, remote_command, true);
+    return runBatchCommandWithRecovery(allocator, machine, remote_command, .{});
 }
 
 pub fn preflight(
@@ -93,13 +152,18 @@ fn runBatchCommandWithRecovery(
     allocator: std.mem.Allocator,
     machine: model.MachineRecord,
     remote_command: []const u8,
-    allow_host_key_recovery: bool,
+    options: BatchCommandOptions,
 ) !exec.Result {
     if (shouldUseFlyMachineCommand(machine)) {
         return runFlyMachineCommand(allocator, machine, remote_command);
     }
 
-    const connection = try prepareConnection(allocator, machine);
+    const connection = prepareConnection(allocator, machine) catch |err| {
+        if (options.emit_resolution_errors and isResolutionError(err)) {
+            printResolutionFailure(machine, err);
+        }
+        return err;
+    };
     defer connection.deinit(allocator);
     const wrapped_command = try wrappedRemoteCommand(allocator, remote_command);
     defer allocator.free(wrapped_command);
@@ -111,22 +175,27 @@ fn runBatchCommandWithRecovery(
     try args.appendSlice(allocator, &.{ "-T", connection.destination, wrapped_command });
 
     var result = try exec.run(allocator, args.items);
-    if (allow_host_key_recovery and !result.succeeded() and isHostKeyMismatch(result.stderr)) {
+    if (options.allow_host_key_recovery and !result.succeeded() and isHostKeyMismatch(result.stderr)) {
         result.deinit(allocator);
         if (try clearKnownHostAlias(allocator, machine)) {
             std.debug.print("[warn] cleared stale SSH host key for machine '{s}' and retried\n", .{machine.name});
         }
-        return runBatchCommandWithRecovery(allocator, machine, remote_command, false);
+        return runBatchCommandWithRecovery(allocator, machine, remote_command, .{
+            .allow_host_key_recovery = false,
+            .emit_resolution_errors = options.emit_resolution_errors,
+        });
     }
 
     return result;
 }
 
 fn shouldUseFlyMachineCommand(machine: model.MachineRecord) bool {
+    if (machine.ssh_resolver != .system) return false;
+    if (machine.require_private_ssh) return false;
     if (machine.provider != .fly) return false;
     const app = machine.app orelse return false;
     if (machine.ssh_port != 22) return false;
-    return isDefaultFlySshHost(app, machine.host);
+    return isDefaultFlySshHost(app, model.configuredSshHost(machine));
 }
 
 fn isDefaultFlySshHost(app: []const u8, host: []const u8) bool {
@@ -241,6 +310,17 @@ fn prepareConnection(
     allocator: std.mem.Allocator,
     machine: model.MachineRecord,
 ) !ConnectionParts {
+    return prepareConnectionWithRunner(allocator, machine, exec.run);
+}
+
+fn prepareConnectionWithRunner(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    runner: CommandRunner,
+) !ConnectionParts {
+    var endpoint = try resolveEndpointMetadataWithRunner(allocator, machine, runner, .prefer_existing);
+    defer endpoint.deinit(allocator);
+
     const known_hosts_path = try paths.defaultKnownHostsPath(allocator);
     errdefer allocator.free(known_hosts_path);
     defer allocator.free(known_hosts_path);
@@ -251,7 +331,7 @@ fn prepareConnection(
 
     const destination = try std.fmt.allocPrint(allocator, "{s}@{s}", .{
         machine.ssh_user,
-        machine.host,
+        endpoint.endpoint_host,
     });
     errdefer allocator.free(destination);
 
@@ -283,6 +363,115 @@ fn prepareConnection(
         .port_option = port_option,
         .identity_file = identity_file,
     };
+}
+
+pub fn resolveEndpointMetadata(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+) !EndpointMetadata {
+    return resolveEndpointMetadataWithRunner(allocator, machine, exec.run, .refresh);
+}
+
+fn resolveEndpointMetadataWithRunner(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+    runner: CommandRunner,
+    mode: EndpointResolutionMode,
+) !EndpointMetadata {
+    const configured_host = try allocator.dupe(u8, model.configuredSshHost(machine));
+    errdefer allocator.free(configured_host);
+
+    if (machine.require_private_ssh and machine.ssh_resolver != .tailscale) {
+        return error.PrivateSshRequiresPrivateResolver;
+    }
+
+    switch (machine.ssh_resolver) {
+        .system, .none => {
+            return .{
+                .configured_host = configured_host,
+                .endpoint_host = configured_host,
+                .resolver = machine.ssh_resolver,
+            };
+        },
+        .tailscale => {
+            if (mode == .prefer_existing) {
+                if (machine.ssh_resolved_host) |existing| {
+                    const resolved_host = try allocator.dupe(u8, existing);
+                    errdefer allocator.free(resolved_host);
+
+                    return .{
+                        .configured_host = configured_host,
+                        .resolved_host = resolved_host,
+                        .endpoint_host = resolved_host,
+                        .resolver = machine.ssh_resolver,
+                    };
+                }
+            }
+
+            const resolved_host = try resolveTailscaleHostWithRunner(allocator, configured_host, runner);
+            errdefer allocator.free(resolved_host);
+
+            return .{
+                .configured_host = configured_host,
+                .resolved_host = resolved_host,
+                .endpoint_host = resolved_host,
+                .resolver = machine.ssh_resolver,
+            };
+        },
+    }
+}
+
+fn resolveTailscaleHostWithRunner(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    runner: CommandRunner,
+) ![]u8 {
+    const result = runner(allocator, &.{ "tailscale", "ip", "-4", host }) catch {
+        return error.SshResolutionFailed;
+    };
+    defer result.deinit(allocator);
+
+    if (!result.succeeded()) {
+        return error.SshResolutionFailed;
+    }
+
+    return parseTailscaleIpv4Output(allocator, result.stdout);
+}
+
+fn parseTailscaleIpv4Output(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+) ![]u8 {
+    const trimmed = std.mem.trim(u8, output, " \t\r\n");
+    if (trimmed.len == 0) return error.SshResolutionFailed;
+
+    var tokens = std.mem.tokenizeAny(u8, trimmed, " \t\r\n");
+    const ip = tokens.next() orelse return error.SshResolutionFailed;
+    if (tokens.next() != null) return error.SshResolutionFailed;
+
+    _ = std.net.Address.parseIp4(ip, 0) catch return error.SshResolutionFailed;
+    return allocator.dupe(u8, ip);
+}
+
+fn isResolutionError(err: anyerror) bool {
+    return err == error.SshResolutionFailed or
+        err == error.PrivateSshRequiresPrivateResolver;
+}
+
+fn printResolutionFailure(machine: model.MachineRecord, err: anyerror) void {
+    std.debug.print(
+        "[error] ssh resolver '{s}' failed for host '{s}': {s}\n",
+        .{
+            model.sshResolverName(machine.ssh_resolver),
+            model.configuredSshHost(machine),
+            @errorName(err),
+        },
+    );
+    if (machine.require_private_ssh) {
+        std.debug.print("[hint] private SSH is required; no system or public SSH fallback was attempted\n", .{});
+    } else if (machine.ssh_resolver == .tailscale) {
+        std.debug.print("[hint] confirm `tailscale ip -4 {s}` succeeds locally\n", .{model.configuredSshHost(machine)});
+    }
 }
 
 fn appendCommonArgs(
@@ -428,6 +617,166 @@ test "private fly ssh endpoint uses direct openssh transport" {
     try std.testing.expect(!shouldUseFlyMachineCommand(machine));
 }
 
+test "tailscale resolver disables fly machine ssh shortcut" {
+    const machine = model.MachineRecord{
+        .name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+        .id = "machine-id",
+        .provider_scope = "devbox",
+        .app = "devbox",
+        .host = "devbox.fly.dev",
+        .ssh_port = 22,
+        .ssh_resolver = .tailscale,
+        .require_private_ssh = true,
+        .ssh_user = "rove",
+    };
+
+    try std.testing.expect(!shouldUseFlyMachineCommand(machine));
+}
+
+test "parse tailscale ipv4 resolver output" {
+    const allocator = std.testing.allocator;
+    const ip = try parseTailscaleIpv4Output(allocator, "100.64.1.2\n");
+    defer allocator.free(ip);
+
+    try std.testing.expectEqualStrings("100.64.1.2", ip);
+}
+
+test "reject empty and malformed tailscale resolver output" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.SshResolutionFailed, parseTailscaleIpv4Output(allocator, "\n"));
+    try std.testing.expectError(error.SshResolutionFailed, parseTailscaleIpv4Output(allocator, "not-an-ip\n"));
+    try std.testing.expectError(error.SshResolutionFailed, parseTailscaleIpv4Output(allocator, "100.64.1.2\n100.64.1.3\n"));
+}
+
+test "tailscale resolver records configured and resolved hosts" {
+    const allocator = std.testing.allocator;
+    const machine = model.MachineRecord{
+        .name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+        .id = "machine-id",
+        .host = "private-work",
+        .ssh_port = 2222,
+        .ssh_resolver = .tailscale,
+        .require_private_ssh = true,
+        .ssh_user = "rove",
+    };
+
+    const endpoint = try resolveEndpointMetadataWithRunner(allocator, machine, fakeTailscaleSuccess, .refresh);
+    defer endpoint.deinit(allocator);
+
+    try std.testing.expectEqualStrings("private-work", endpoint.configured_host);
+    try std.testing.expectEqualStrings("100.64.1.2", endpoint.resolved_host.?);
+    try std.testing.expectEqualStrings("100.64.1.2", endpoint.endpoint_host);
+}
+
+test "tailscale resolver command failure fails closed" {
+    const allocator = std.testing.allocator;
+    const machine = model.MachineRecord{
+        .name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+        .id = "machine-id",
+        .host = "private-work",
+        .ssh_port = 2222,
+        .ssh_resolver = .tailscale,
+        .require_private_ssh = true,
+        .ssh_user = "rove",
+    };
+
+    try std.testing.expectError(
+        error.SshResolutionFailed,
+        resolveEndpointMetadataWithRunner(allocator, machine, fakeTailscaleFailure, .refresh),
+    );
+}
+
+test "private ssh policy rejects non-private resolver before connection" {
+    const allocator = std.testing.allocator;
+    const machine = model.MachineRecord{
+        .name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+        .id = "machine-id",
+        .host = "private-work",
+        .ssh_port = 2222,
+        .require_private_ssh = true,
+        .ssh_user = "rove",
+    };
+
+    try std.testing.expectError(
+        error.PrivateSshRequiresPrivateResolver,
+        resolveEndpointMetadataWithRunner(allocator, machine, fakeTailscaleSuccess, .refresh),
+    );
+}
+
+test "fresh tailscale resolution ignores previously recorded endpoint" {
+    const allocator = std.testing.allocator;
+    const machine = model.MachineRecord{
+        .name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+        .id = "machine-id",
+        .host = "private-work",
+        .ssh_configured_host = "private-work",
+        .ssh_resolved_host = "100.64.9.9",
+        .ssh_port = 2222,
+        .ssh_resolver = .tailscale,
+        .require_private_ssh = true,
+        .ssh_user = "rove",
+    };
+
+    const endpoint = try resolveEndpointMetadataWithRunner(allocator, machine, fakeTailscaleSuccess, .refresh);
+    defer endpoint.deinit(allocator);
+
+    try std.testing.expectEqualStrings("100.64.1.2", endpoint.resolved_host.?);
+    try std.testing.expectEqualStrings("100.64.1.2", endpoint.endpoint_host);
+}
+
+test "prepared connection reuses recorded resolved endpoint" {
+    const allocator = std.testing.allocator;
+    const machine = model.MachineRecord{
+        .name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+        .id = "machine-id",
+        .host = "private-work",
+        .ssh_configured_host = "private-work",
+        .ssh_resolved_host = "100.64.9.9",
+        .ssh_port = 2222,
+        .ssh_resolver = .tailscale,
+        .require_private_ssh = true,
+        .ssh_user = "rove",
+    };
+
+    const connection = try prepareConnectionWithRunner(allocator, machine, fakeTailscaleFailure);
+    defer connection.deinit(allocator);
+
+    try std.testing.expectEqualStrings("rove@100.64.9.9", connection.destination);
+}
+
+test "tailscale resolved endpoint is used as ssh destination" {
+    const allocator = std.testing.allocator;
+    const machine = model.MachineRecord{
+        .name = "work",
+        .target_name = "devbox",
+        .provider = .fly,
+        .id = "machine-id",
+        .host = "private-work",
+        .ssh_port = 2222,
+        .ssh_resolver = .tailscale,
+        .require_private_ssh = true,
+        .ssh_user = "rove",
+    };
+
+    const connection = try prepareConnectionWithRunner(allocator, machine, fakeTailscaleSuccess);
+    defer connection.deinit(allocator);
+
+    try std.testing.expectEqualStrings("rove@100.64.1.2", connection.destination);
+}
+
 test "openssh args ignore user ssh config" {
     const allocator = std.testing.allocator;
     var args = std.ArrayListUnmanaged([]const u8){};
@@ -466,4 +815,28 @@ test "wrapped remote command preserves shell quoting" {
     defer allocator.free(wrapped);
 
     try std.testing.expectEqualStrings(expected, wrapped);
+}
+
+fn fakeTailscaleSuccess(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) anyerror!exec.Result {
+    _ = argv;
+    return .{
+        .term = .{ .Exited = 0 },
+        .stdout = try allocator.dupe(u8, "100.64.1.2\n"),
+        .stderr = try allocator.dupe(u8, ""),
+    };
+}
+
+fn fakeTailscaleFailure(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) anyerror!exec.Result {
+    _ = argv;
+    return .{
+        .term = .{ .Exited = 1 },
+        .stdout = try allocator.dupe(u8, ""),
+        .stderr = try allocator.dupe(u8, "no such host\n"),
+    };
 }

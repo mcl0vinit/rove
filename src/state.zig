@@ -178,6 +178,43 @@ test "find machine by name" {
     const machine = findMachine(&parsed.value, "cpu").?;
     try std.testing.expectEqualStrings("machine-1", machine.id);
     try std.testing.expectEqual(@as(u16, 22), machine.ssh_port);
+    try std.testing.expectEqual(model.SshResolver.system, machine.ssh_resolver);
+    try std.testing.expect(!machine.require_private_ssh);
+    try std.testing.expectEqualStrings("devbox.fly.dev", model.configuredSshHost(machine.*));
+}
+
+test "parse state with resolved ssh endpoint metadata" {
+    const allocator = std.testing.allocator;
+    const contents =
+        \\{
+        \\  "machines": [
+        \\    {
+        \\      "name": "cpu",
+        \\      "provider": "fly",
+        \\      "id": "machine-1",
+        \\      "host": "private-cpu",
+        \\      "ssh_configured_host": "private-cpu",
+        \\      "ssh_resolved_host": "100.64.1.2",
+        \\      "ssh_resolver": "tailscale",
+        \\      "require_private_ssh": true,
+        \\      "ssh_port": 2222,
+        \\      "ssh_user": "rove",
+        \\      "status": "ready"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(model.StateFile, allocator, contents, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    const machine = findMachine(&parsed.value, "cpu").?;
+    try std.testing.expectEqualStrings("private-cpu", model.configuredSshHost(machine.*));
+    try std.testing.expectEqualStrings("100.64.1.2", model.endpointSshHost(machine.*));
+    try std.testing.expectEqual(model.SshResolver.tailscale, machine.ssh_resolver);
+    try std.testing.expect(machine.require_private_ssh);
 }
 
 test "upsert and remove machine in saved state" {
@@ -197,6 +234,8 @@ test "upsert and remove machine in saved state" {
         .id = "machine-1",
         .app = "devbox",
         .host = "devbox.fly.dev",
+        .ssh_configured_host = "devbox.fly.dev",
+        .ssh_resolver = .system,
         .ssh_user = "rove",
         .status = .provisioned,
     }, state_path);
@@ -206,6 +245,8 @@ test "upsert and remove machine in saved state" {
 
     try std.testing.expectEqual(@as(usize, 1), loaded.value.machines.len);
     try std.testing.expectEqualStrings("machine-1", loaded.value.machines[0].id);
+    try std.testing.expectEqualStrings("devbox.fly.dev", loaded.value.machines[0].ssh_configured_host.?);
+    try std.testing.expectEqual(model.SshResolver.system, loaded.value.machines[0].ssh_resolver);
 
     const removed = try removeMachine(allocator, "cpu", state_path);
     try std.testing.expect(removed);
