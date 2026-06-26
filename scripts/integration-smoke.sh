@@ -86,6 +86,10 @@ if [[ "${1:-}" == "machine" && "${2:-}" == "destroy" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "ssh" && "${2:-}" == "console" ]]; then
+  exit 0
+fi
+
 printf 'unexpected flyctl args: %s\n' "$*" >&2
 exit 1
 EOF

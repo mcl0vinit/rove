@@ -401,8 +401,18 @@ fn appendMachineJson(
     try appendJsonNullableString(out, machine.app);
     try out.writer.writeAll(",\"host\":");
     try appendJsonString(out, machine.host);
+    try out.writer.writeAll(",\"ssh_configured_host\":");
+    try appendJsonString(out, model.configuredSshHost(machine));
+    try out.writer.writeAll(",\"ssh_resolved_host\":");
+    try appendJsonNullableString(out, machine.ssh_resolved_host);
+    try out.writer.writeAll(",\"ssh_endpoint_host\":");
+    try appendJsonString(out, model.endpointSshHost(machine));
     try out.writer.writeAll(",\"ssh_port\":");
     try std.json.Stringify.value(machine.ssh_port, .{}, &out.writer);
+    try out.writer.writeAll(",\"ssh_resolver\":");
+    try appendJsonString(out, model.sshResolverName(machine.ssh_resolver));
+    try out.writer.writeAll(",\"require_private_ssh\":");
+    try out.writer.writeAll(if (machine.require_private_ssh) "true" else "false");
     try out.writer.writeAll(",\"ssh_identity_file\":");
     try appendJsonNullableString(out, machine.ssh_identity_file);
     try out.writer.writeAll(",\"region\":");
@@ -580,18 +590,37 @@ fn handleInspect(
 fn printMachineRow(stdout: anytype, machine: model.MachineRecord) !void {
     try std.fmt.format(
         stdout,
-        "{s}\t{s}\t{s}\t{s}\t{s}\t{s}:{d}\t{s}\n",
+        "{s}\t{s}\t{s}\t{s}\t{s}\t",
         .{
             machine.name,
             machine.target_name orelse machine.name,
             model.providerName(machine.provider),
             model.statusName(machine.status),
             machine.remote_state orelse "-",
-            machine.host,
-            machine.ssh_port,
-            machine.region orelse "-",
         },
     );
+    try printSshEndpoint(stdout, machine);
+    try std.fmt.format(stdout, "\t{s}\n", .{machine.region orelse "-"});
+}
+
+fn printSshEndpoint(stdout: anytype, machine: model.MachineRecord) !void {
+    const configured_host = model.configuredSshHost(machine);
+    const endpoint_host = model.endpointSshHost(machine);
+    if (machine.ssh_resolved_host != null and !std.mem.eql(u8, configured_host, endpoint_host)) {
+        try std.fmt.format(stdout, "{s}->{s}:{d}", .{ configured_host, endpoint_host, machine.ssh_port });
+        return;
+    }
+
+    if (machine.ssh_resolver != .system) {
+        try std.fmt.format(
+            stdout,
+            "{s}:{d}[{s}]",
+            .{ configured_host, machine.ssh_port, model.sshResolverName(machine.ssh_resolver) },
+        );
+        return;
+    }
+
+    try std.fmt.format(stdout, "{s}:{d}", .{ configured_host, machine.ssh_port });
 }
 
 fn handleRefresh(
@@ -899,7 +928,10 @@ fn handleAdopt(
         .provider_scope = provider.scopeForConfig(target_provider_config),
         .app = provider.legacyAppAliasForConfig(target_provider_config),
         .host = adopted_host,
+        .ssh_configured_host = adopted_host,
         .ssh_port = inspected.ssh_port orelse 22,
+        .ssh_resolver = target.ssh_resolver,
+        .require_private_ssh = target.require_private_ssh,
         .ssh_identity_file = target.ssh_identity_file,
         .region = inspected.region,
         .remote_state = inspected.remote_state,
@@ -1037,7 +1069,10 @@ fn handleRun(
         .provider_scope = provider.scopeForConfig(target_provider_config),
         .app = provider.legacyAppAliasForConfig(target_provider_config),
         .host = created.host,
+        .ssh_configured_host = created.host,
         .ssh_port = created.ssh_port,
+        .ssh_resolver = target.ssh_resolver,
+        .require_private_ssh = target.require_private_ssh,
         .ssh_identity_file = target.ssh_identity_file,
         .region = created.region,
         .ssh_user = target.ssh_user,
@@ -1098,6 +1133,31 @@ fn handleRun(
         );
         return error.HandledFailure;
     };
+
+    var resolved_machine = resolveMachineEndpointForUse(allocator, machine) catch |err| {
+        machine.status = .provisioned_unreachable;
+        try state.upsertMachine(allocator, machine, null);
+
+        try std.fmt.format(
+            stderr,
+            "[error] ssh resolver '{s}' failed for instance '{s}' host '{s}': {s}\n" ++
+                "[hint] inspect the machine with `rove status {s}` once private reachability works\n",
+            .{
+                model.sshResolverName(machine.ssh_resolver),
+                machine.name,
+                model.configuredSshHost(machine),
+                @errorName(err),
+                machine.name,
+            },
+        );
+        if (machine.require_private_ssh) {
+            try stderr.writeAll("[hint] private SSH is required; no system or public SSH fallback was attempted\n");
+        }
+        return error.HandledFailure;
+    };
+    defer resolved_machine.deinit(allocator);
+    machine = resolved_machine.value;
+    try state.upsertMachine(allocator, machine, null);
 
     if (target.startup_script) |startup_script| {
         machine.status = .bootstrapping;
@@ -1170,7 +1230,26 @@ fn handleSsh(
         return error.HandledFailure;
     }
 
-    const term = ssh.openInteractive(allocator, machine.*) catch |err| {
+    var resolved_machine = resolveMachineEndpointForUse(allocator, machine.*) catch |err| {
+        try std.fmt.format(
+            stderr,
+            "[error] ssh resolver '{s}' failed for machine '{s}' host '{s}': {s}\n",
+            .{
+                model.sshResolverName(machine.ssh_resolver),
+                machine_name,
+                model.configuredSshHost(machine.*),
+                @errorName(err),
+            },
+        );
+        if (machine.require_private_ssh) {
+            try stderr.writeAll("[hint] private SSH is required; no system or public SSH fallback was attempted\n");
+        }
+        return error.HandledFailure;
+    };
+    defer resolved_machine.deinit(allocator);
+    try state.upsertMachine(allocator, resolved_machine.value, null);
+
+    const term = ssh.openInteractive(allocator, resolved_machine.value) catch |err| {
         try std.fmt.format(
             stderr,
             "[error] failed to start ssh for machine '{s}': {s}\n",
@@ -1220,7 +1299,26 @@ fn handleExec(
     const remote_command = try renderRemoteCommand(allocator, command.argv);
     defer allocator.free(remote_command);
 
-    const result = ssh.runBatchCommand(allocator, machine.*, remote_command) catch |err| {
+    var resolved_machine = resolveMachineEndpointForUse(allocator, machine.*) catch |err| {
+        try std.fmt.format(
+            stderr,
+            "[error] ssh resolver '{s}' failed for machine '{s}' host '{s}': {s}\n",
+            .{
+                model.sshResolverName(machine.ssh_resolver),
+                command.machine_name,
+                model.configuredSshHost(machine.*),
+                @errorName(err),
+            },
+        );
+        if (machine.require_private_ssh) {
+            try stderr.writeAll("[hint] private SSH is required; no system or public SSH fallback was attempted\n");
+        }
+        return error.HandledFailure;
+    };
+    defer resolved_machine.deinit(allocator);
+    try state.upsertMachine(allocator, resolved_machine.value, null);
+
+    const result = ssh.runBatchCommand(allocator, resolved_machine.value, remote_command) catch |err| {
         try std.fmt.format(
             stderr,
             "[error] failed to execute command on machine '{s}': {s}\n",
@@ -1336,6 +1434,15 @@ const RefreshedMachine = struct {
     }
 };
 
+const EndpointResolvedMachine = struct {
+    value: model.MachineRecord,
+    endpoint: ssh.EndpointMetadata,
+
+    fn deinit(self: EndpointResolvedMachine, allocator: std.mem.Allocator) void {
+        self.endpoint.deinit(allocator);
+    }
+};
+
 const RefreshReport = struct {
     refreshed: RefreshedMachine,
     result: []const u8,
@@ -1346,11 +1453,27 @@ const RefreshReport = struct {
     }
 };
 
+fn resolveMachineEndpointForUse(
+    allocator: std.mem.Allocator,
+    machine: model.MachineRecord,
+) !EndpointResolvedMachine {
+    const endpoint = try ssh.resolveEndpointMetadata(allocator, machine);
+    var resolved = machine;
+    endpoint.applyToMachine(&resolved);
+    return .{
+        .value = resolved,
+        .endpoint = endpoint,
+    };
+}
+
 fn refreshMachineFromProvider(
     allocator: std.mem.Allocator,
     machine: model.MachineRecord,
 ) !RefreshedMachine {
     var refreshed = RefreshedMachine{ .value = machine };
+    if (refreshed.value.ssh_configured_host == null) {
+        refreshed.value.ssh_configured_host = refreshed.value.host;
+    }
 
     const machine_provider_config = providerConfigForMachine(machine) catch {
         refreshed.value.remote_state = "unknown";
@@ -1375,7 +1498,12 @@ fn refreshMachineFromProvider(
         refreshed.owned_machine_name = machine_name;
     }
     if (inspected.host) |host| {
+        const previous_configured_host = model.configuredSshHost(refreshed.value);
         refreshed.value.host = host;
+        refreshed.value.ssh_configured_host = host;
+        if (!std.mem.eql(u8, previous_configured_host, host)) {
+            refreshed.value.ssh_resolved_host = null;
+        }
         refreshed.owned_host = host;
     }
     if (inspected.ssh_port) |ssh_port| {
@@ -1451,16 +1579,16 @@ fn refreshAndReportMachine(
 
     try std.fmt.format(
         stdout,
-        "{s}\t{s}\t{s}\t{s}\t{s}:{d}\n",
+        "{s}\t{s}\t{s}\t{s}\t",
         .{
             machine.name,
             report.result,
             model.statusName(report.refreshed.value.status),
             report.refreshed.value.remote_state orelse "-",
-            report.refreshed.value.host,
-            report.refreshed.value.ssh_port,
         },
     );
+    try printSshEndpoint(stdout, report.refreshed.value);
+    try stdout.writeAll("\n");
 }
 
 fn doctorTrackedMachine(
@@ -1494,7 +1622,26 @@ fn doctorTrackedMachine(
 
     try printDoctorRow(stdout, "machine", "ok", remote_detail);
 
-    ssh.preflight(allocator, refreshed.value) catch |err| {
+    var resolved_machine = resolveMachineEndpointForUse(allocator, refreshed.value) catch |err| {
+        has_errors.* = true;
+        const detail = try std.fmt.allocPrint(
+            allocator,
+            "{s}: ssh resolver {s} failed for {s}: {s}",
+            .{
+                machine.name,
+                model.sshResolverName(refreshed.value.ssh_resolver),
+                model.configuredSshHost(refreshed.value),
+                @errorName(err),
+            },
+        );
+        defer allocator.free(detail);
+        try printDoctorRow(stdout, "ssh", "error", detail);
+        return;
+    };
+    defer resolved_machine.deinit(allocator);
+    try state.upsertMachine(allocator, resolved_machine.value, null);
+
+    ssh.preflight(allocator, resolved_machine.value) catch |err| {
         has_errors.* = true;
         const detail = try std.fmt.allocPrint(allocator, "{s}: ssh preflight failed: {s}", .{ machine.name, @errorName(err) });
         defer allocator.free(detail);
@@ -1504,8 +1651,8 @@ fn doctorTrackedMachine(
 
     const ssh_detail = try std.fmt.allocPrint(allocator, "{s}: SSH is reachable on {s}:{d}", .{
         machine.name,
-        refreshed.value.host,
-        refreshed.value.ssh_port,
+        model.endpointSshHost(resolved_machine.value),
+        resolved_machine.value.ssh_port,
     });
     defer allocator.free(ssh_detail);
     try printDoctorRow(stdout, "ssh", "ok", ssh_detail);
@@ -1567,7 +1714,7 @@ fn providerConfigForMachine(machine: model.MachineRecord) !provider.ProviderTarg
     return switch (machine.provider) {
         .fly => .{ .fly = .{
             .app = machine.provider_scope orelse machine.app orelse return error.MissingProviderScope,
-            .ssh_host = machine.host,
+            .ssh_host = model.configuredSshHost(machine),
             .ssh_port = machine.ssh_port,
         } },
         .vast => .{ .vast = .{} },

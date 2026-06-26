@@ -29,8 +29,9 @@ Environment:
   TAILSCALE_BIN             tailscale binary override
   ALLOW_PUBLIC_FLY_IPS=1    Warn instead of failing if the app has public IPs
 
-The target should use the private Fly shape: ports=[],
-inject_authorized_keys=false, ssh_host, and ssh_port.
+The target should use the private Fly shape: ssh_resolver=tailscale,
+require_private_ssh=true, ports=[], inject_authorized_keys=false, ssh_host,
+and ssh_port.
 EOF
 }
 
@@ -159,7 +160,17 @@ fi
 
 ssh_host_template="$(jq -r '(.fly.ssh_host // empty)' <<<"${target_json}")"
 ssh_port="$(jq -r '(.fly.ssh_port // 22)' <<<"${target_json}")"
+ssh_resolver="$(jq -r '(.ssh_resolver // "system")' <<<"${target_json}")"
+require_private_ssh="$(jq -r '(.require_private_ssh // false)' <<<"${target_json}")"
 ports_len="$(jq -r 'if .fly.ports == null then "null" else (.fly.ports | length | tostring) end' <<<"${target_json}")"
+if [[ "${ssh_resolver}" != "tailscale" ]]; then
+  printf '[private-smoke:error] target %s must set ssh_resolver=tailscale for private smoke\n' "$target" >&2
+  exit 1
+fi
+if [[ "${require_private_ssh}" != "true" ]]; then
+  printf '[private-smoke:error] target %s must set require_private_ssh=true for private smoke\n' "$target" >&2
+  exit 1
+fi
 if [[ "${ports_len}" != "0" ]]; then
   printf '[private-smoke:error] target %s is not private-only: fly.ports should be []\n' "$target" >&2
   exit 1
@@ -288,9 +299,9 @@ while true; do
   fi
 
   if [[ "${tailnet_recorded}" -eq 0 && -n "${ssh_host}" ]] && command -v "${tailscale_bin}" >/dev/null 2>&1; then
-    if "${tailscale_bin}" status 2>/dev/null | awk '{print $2}' | grep -Fx "${ssh_host}" >/dev/null 2>&1; then
+    if resolved_tailnet_ip="$("${tailscale_bin}" ip -4 "${ssh_host}" 2>/dev/null)"; then
       tailnet_recorded=1
-      event "tailscale_visible" "ok" "${ssh_host}"
+      event "tailscale_visible" "ok" "${ssh_host} -> ${resolved_tailnet_ip}"
     fi
   fi
 
@@ -321,12 +332,17 @@ event "ssh_ready" "ok" "rove up completed"
 status_json="$("${rove_bin}" status "${instance}" --json)"
 machine_id="$(jq -r '.machine.id // empty' <<<"${status_json}")"
 machine_name="$(jq -r '.machine.machine_name // empty' <<<"${status_json}")"
-ssh_host="$(jq -r '.machine.host // empty' <<<"${status_json}")"
+ssh_host="$(jq -r '.machine.ssh_configured_host // .machine.host // empty' <<<"${status_json}")"
+ssh_resolved_host="$(jq -r '.machine.ssh_resolved_host // empty' <<<"${status_json}")"
 ssh_port="$(jq -r '.machine.ssh_port // empty' <<<"${status_json}")"
 
 if [[ -z "${machine_id}" || -z "${ssh_host}" ]]; then
   fail "rove status did not return machine id and host"
 fi
+if [[ -z "${ssh_resolved_host}" ]]; then
+  fail "rove status did not return a resolved private SSH host"
+fi
+event "rove_resolved_endpoint" "ok" "${ssh_host} -> ${ssh_resolved_host}:${ssh_port}"
 
 config_json="$("${fly_bin}" machine status "${machine_id}" --app "${app}" --display-config 2>/dev/null | awk '
   BEGIN { started=0; depth=0 }

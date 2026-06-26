@@ -21,6 +21,7 @@ pub const Error = std.fs.File.OpenError ||
         InvalidFlyPort,
         PublicFlyPortsRequireOptIn,
         InvalidSshPort,
+        PrivateSshRequiresPrivateResolver,
         TargetNotFound,
     };
 
@@ -181,6 +182,9 @@ fn validate(
     for (targets, 0..) |target, index| {
         if (target.name.len == 0) return error.EmptyTargetName;
         if (target.ssh_user.len == 0) return error.MissingSshUser;
+        if (target.require_private_ssh and target.ssh_resolver != .tailscale) {
+            return error.PrivateSshRequiresPrivateResolver;
+        }
 
         switch (target.provider) {
             .fly => {
@@ -282,6 +286,8 @@ test "parse fly private access launch options" {
         \\      "name": "devbox",
         \\      "provider": "fly",
         \\      "ssh_user": "rove",
+        \\      "ssh_resolver": "tailscale",
+        \\      "require_private_ssh": true,
         \\      "ssh_identity_file": "~/.ssh/id_ed25519",
         \\      "fly": {
         \\        "app": "devbox",
@@ -308,6 +314,8 @@ test "parse fly private access launch options" {
 
     const target = try resolveTarget(&parsed.value, "devbox");
     try std.testing.expectEqualStrings("~/.ssh/id_ed25519", target.ssh_identity_file.?);
+    try std.testing.expectEqual(model.SshResolver.tailscale, target.ssh_resolver);
+    try std.testing.expect(target.require_private_ssh);
 
     const fly = resolveFlyTarget(target.*);
     try std.testing.expect(fly.ports != null);
@@ -318,6 +326,90 @@ test "parse fly private access launch options" {
     try std.testing.expectEqual(@as(u16, 2222), fly.ssh_port.?);
     try std.testing.expect(fly.env != null);
     try std.testing.expect(fly.env.? == .object);
+}
+
+test "target ssh resolver defaults preserve system behavior" {
+    const allocator = std.testing.allocator;
+    const contents =
+        \\{
+        \\  "targets": [
+        \\    {
+        \\      "name": "devbox",
+        \\      "provider": "fly",
+        \\      "ssh_user": "rove",
+        \\      "fly": {
+        \\        "app": "devbox",
+        \\        "image": "registry.fly.io/devbox:latest",
+        \\        "vm_size": "shared-cpu-2x"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var parsed = try parseSlice(allocator, contents, ValidationOptions{
+        .check_startup_script_paths = false,
+    });
+    defer parsed.deinit();
+
+    const target = try resolveTarget(&parsed.value, "devbox");
+    try std.testing.expectEqual(model.SshResolver.system, target.ssh_resolver);
+    try std.testing.expect(!target.require_private_ssh);
+}
+
+test "reject private ssh without private resolver" {
+    const allocator = std.testing.allocator;
+    const contents =
+        \\{
+        \\  "targets": [
+        \\    {
+        \\      "name": "devbox",
+        \\      "provider": "fly",
+        \\      "ssh_user": "rove",
+        \\      "require_private_ssh": true,
+        \\      "fly": {
+        \\        "app": "devbox",
+        \\        "image": "registry.fly.io/devbox:latest",
+        \\        "vm_size": "shared-cpu-2x"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    try std.testing.expectError(
+        error.PrivateSshRequiresPrivateResolver,
+        parseSlice(allocator, contents, ValidationOptions{
+            .check_startup_script_paths = false,
+        }),
+    );
+}
+
+test "reject invalid ssh resolver values" {
+    const allocator = std.testing.allocator;
+    const contents =
+        \\{
+        \\  "targets": [
+        \\    {
+        \\      "name": "devbox",
+        \\      "provider": "fly",
+        \\      "ssh_user": "rove",
+        \\      "ssh_resolver": "magic",
+        \\      "fly": {
+        \\        "app": "devbox",
+        \\        "image": "registry.fly.io/devbox:latest",
+        \\        "vm_size": "shared-cpu-2x"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var parsed = parseSlice(allocator, contents, ValidationOptions{
+        .check_startup_script_paths = false,
+    }) catch return;
+    parsed.deinit();
+    return error.ExpectedInvalidSshResolver;
 }
 
 test "reject public fly ports without explicit opt in" {

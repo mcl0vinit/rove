@@ -153,16 +153,18 @@ Example private target:
   "name": "devbox",
   "provider": "fly",
   "ssh_user": "rove",
+  "ssh_resolver": "tailscale",
+  "require_private_ssh": true,
   "fly": {
     "app": "your-fly-app",
     "image": "registry.fly.io/your-fly-app:deployment-<id>@sha256:<digest>",
     "vm_size": "shared-cpu-2x",
     "ports": [],
     "inject_authorized_keys": false,
-    "ssh_host": "mesh-{name}",
+    "ssh_host": "private-{name}",
     "ssh_port": 2222,
     "env": {
-      "TAILSCALE_HOSTNAME": "mesh-{name}",
+      "TAILSCALE_HOSTNAME": "private-{name}",
       "TAILSCALE_SERVE_SSH": "1"
     }
   }
@@ -184,6 +186,8 @@ Fly fields:
 
 Target fields:
 - `ssh_identity_file`: optional private key path for Rove's SSH operations. Omit it to use Rove's managed key; if `inject_authorized_keys` is `false`, make sure the `AUTHORIZED_KEYS` Fly secret contains the matching public key.
+- `ssh_resolver`: optional SSH host resolver. Defaults to `system`, which preserves normal OpenSSH/provider behavior. Set to `tailscale` to resolve `ssh_host` with `tailscale ip -4 <host>` before SSH operations. `none` records that no resolver policy is being used.
+- `require_private_ssh`: optional guardrail, default `false`. When `true`, Rove requires a private resolver such as `tailscale` and fails closed instead of falling back to public/system SSH.
 - `startup_script`: optional post-SSH bootstrap. The baked Mesh devbox image should not need this for `mesh` or `meshd`; dotfiles image boot owns that setup.
 
 Legacy top-level Fly fields are still accepted for older configs, but new configs should use the nested `fly` block.
@@ -198,11 +202,11 @@ rove up devbox --name work
 rove inspect work --json
 ```
 
-Verify that Rove reaches the machine over Tailscale Serve SSH, not public Fly
-ingress:
+Verify that Rove reaches the machine over the private resolver path, not public
+Fly ingress:
 
 ```bash
-tailscale status | grep 'mesh-work'
+tailscale ip -4 private-work
 rove exec work -- hostname
 flyctl machine list --app <fly-app>
 flyctl ips list --app <fly-app>
@@ -247,8 +251,8 @@ the smoke helper to prove the actual runtime path.
 
 Troubleshooting:
 - Missing secrets: confirm `flyctl secrets list --app <fly-app>` includes `AUTHORIZED_KEYS` and `MESH_TAILSCALE_AUTHKEY`; do not print secret values.
-- No Tailscale IP or DNS name: check the image boot logs from Fly, confirm the auth key is valid, and verify `TAILSCALE_HOSTNAME` rendered to the expected `mesh-<name>`.
-- Rove cannot SSH: confirm `tailscale status` shows the host, `nc -vz mesh-<name> 2222` succeeds, and the `AUTHORIZED_KEYS` secret includes Rove's public key.
+- No Tailscale IP or DNS name: check the image boot logs from Fly, confirm the auth key is valid, and verify `TAILSCALE_HOSTNAME` rendered to the expected private hostname.
+- Rove cannot SSH: confirm `tailscale ip -4 <ssh-host>` succeeds, the resolved IP accepts TCP on the configured SSH port, and the `AUTHORIZED_KEYS` secret includes Rove's public key.
 - Wrong image ref: run `rove doctor` and inspect the target image; repin to the digest emitted by the dotfiles publish wrapper.
 - Public ports accidentally configured: set `"ports": []` in the target and relaunch. Non-empty `ports` require `"allow_public_ports": true`.
 - Higher-level peer validation fails: first prove `rove exec <name> -- hostname` works, then use that tool's diagnostics to inspect runtime state and peer health.
@@ -317,7 +321,12 @@ Rove's script-facing API is JSON on stdout and errors or warnings on stderr.
 The stable normalized SSH endpoint is:
 - `ssh_user`
 - `host`
+- `ssh_configured_host`
+- `ssh_resolved_host`
+- `ssh_endpoint_host`
 - `ssh_port`
+- `ssh_resolver`
+- `require_private_ssh`
 
 Common machine fields:
 
@@ -331,7 +340,12 @@ Common machine fields:
   "provider_scope": null,
   "app": null,
   "host": "ssh5.vast.ai",
+  "ssh_configured_host": "ssh5.vast.ai",
+  "ssh_resolved_host": null,
+  "ssh_endpoint_host": "ssh5.vast.ai",
   "ssh_port": 32022,
+  "ssh_resolver": "system",
+  "require_private_ssh": false,
   "region": "US",
   "remote_state": "running",
   "ssh_user": "root",
@@ -354,7 +368,12 @@ Machine-list commands return:
       "provider_scope": "your-fly-app",
       "app": "your-fly-app",
       "host": "your-fly-app.fly.dev",
+      "ssh_configured_host": "your-fly-app.fly.dev",
+      "ssh_resolved_host": null,
+      "ssh_endpoint_host": "your-fly-app.fly.dev",
       "ssh_port": 22,
+      "ssh_resolver": "system",
+      "require_private_ssh": false,
       "region": "iad",
       "remote_state": "started",
       "ssh_user": "rove",
@@ -378,7 +397,12 @@ Single-machine commands return:
     "provider_scope": "your-fly-app",
     "app": "your-fly-app",
     "host": "your-fly-app.fly.dev",
+    "ssh_configured_host": "your-fly-app.fly.dev",
+    "ssh_resolved_host": null,
+    "ssh_endpoint_host": "your-fly-app.fly.dev",
     "ssh_port": 22,
+    "ssh_resolver": "system",
+    "require_private_ssh": false,
     "region": "iad",
     "remote_state": "started",
     "ssh_user": "rove",
