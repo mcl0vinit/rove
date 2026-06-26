@@ -1878,6 +1878,9 @@ fn lifecycleFromRemoteState(
         std.ascii.eqlIgnoreCase(value, "running") or
         std.ascii.eqlIgnoreCase(value, "frozen"))
     {
+        if (fallback == .checking_readiness or fallback == .readiness_failed) {
+            return fallback;
+        }
         return .ready;
     }
 
@@ -1905,6 +1908,25 @@ fn lifecycleFromRemoteState(
     }
 
     return fallback;
+}
+
+test "remote running states preserve readiness lifecycle during refresh" {
+    const running_states = [_][]const u8{ "started", "running", "frozen" };
+
+    for (running_states) |remote_state| {
+        try std.testing.expectEqual(
+            model.LifecycleStatus.checking_readiness,
+            lifecycleFromRemoteState(remote_state, .checking_readiness),
+        );
+        try std.testing.expectEqual(
+            model.LifecycleStatus.readiness_failed,
+            lifecycleFromRemoteState(remote_state, .readiness_failed),
+        );
+        try std.testing.expectEqual(
+            model.LifecycleStatus.ready,
+            lifecycleFromRemoteState(remote_state, .provisioned),
+        );
+    }
 }
 
 fn isValidInstanceName(name: []const u8) bool {

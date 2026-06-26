@@ -340,7 +340,10 @@ Rove's script-facing API is JSON on stdout and errors or warnings on stderr.
 
 `rove up <target> --progress-jsonl` writes launch progress events as JSON Lines
 to stderr. This keeps stdout compatible with the existing human output and final
-`--json` machine document. Events use provider-neutral lifecycle phases:
+`--json` machine document. Stderr is still also used for normal diagnostics, so
+consumers should treat only JSON lines with `"type":"launch_progress"` as
+progress events; non-JSON stderr lines may appear on failures. Events use
+provider-neutral lifecycle phases:
 `launch`, `provider_create`, `ssh_wait`, `endpoint_resolution`, `ssh`,
 `bootstrap`, `readiness_command`, and `ready`.
 
