@@ -422,7 +422,7 @@ fn appendMachineJson(
     try out.writer.writeAll(",\"require_private_ssh\":");
     try out.writer.writeAll(if (machine.require_private_ssh) "true" else "false");
     try out.writer.writeAll(",\"ssh_identity_file\":");
-    try appendJsonNullableString(out, machine.ssh_identity_file);
+    try appendJsonNullableString(out, machine.ssh_identity_file orelse "~/.rove/id_ed25519");
     try out.writer.writeAll(",\"region\":");
     try appendJsonNullableString(out, machine.region);
     try out.writer.writeAll(",\"remote_state\":");

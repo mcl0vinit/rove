@@ -528,6 +528,26 @@ fn resolveTailscaleHostWithRunner(
     host: []const u8,
     runner: CommandRunner,
 ) ![]u8 {
+    if (runner(allocator, &.{ "tailscale", "status", "--json" })) |status_result| {
+        defer status_result.deinit(allocator);
+        if (status_result.succeeded()) {
+            const resolved = resolveTailscaleHostFromStatus(allocator, host, status_result.stdout) catch |err| switch (err) {
+                error.NoMatchingTailscalePeer, error.MalformedTailscaleStatus => null,
+                error.NoOnlineTailscalePeer, error.MatchingTailscalePeerMissingIpv4 => return error.SshResolutionFailed,
+                else => |other| return other,
+            };
+            if (resolved) |ip| return ip;
+        }
+    } else |_| {}
+
+    return resolveTailscaleHostWithIpCommand(allocator, host, runner);
+}
+
+fn resolveTailscaleHostWithIpCommand(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    runner: CommandRunner,
+) ![]u8 {
     const result = runner(allocator, &.{ "tailscale", "ip", "-4", host }) catch {
         return error.SshResolutionFailed;
     };
@@ -538,6 +558,94 @@ fn resolveTailscaleHostWithRunner(
     }
 
     return parseTailscaleIpv4Output(allocator, result.stdout);
+}
+
+fn resolveTailscaleHostFromStatus(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    status_json: []const u8,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, status_json, .{
+        .max_value_len = 4 * 1024 * 1024,
+    }) catch return error.MalformedTailscaleStatus;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.MalformedTailscaleStatus;
+    const peers_value = parsed.value.object.get("Peer") orelse return error.NoMatchingTailscalePeer;
+    if (peers_value != .object) return error.MalformedTailscaleStatus;
+
+    var matched: usize = 0;
+    var online_matched: usize = 0;
+    var best_ip: ?[]const u8 = null;
+    var best_created: []const u8 = "";
+
+    var iterator = peers_value.object.iterator();
+    while (iterator.next()) |entry| {
+        const peer_value = entry.value_ptr.*;
+        if (peer_value != .object) continue;
+        if (!tailscalePeerMatchesHost(peer_value, host)) continue;
+        matched += 1;
+
+        if (!(boolField(peer_value, "Online") orelse false)) continue;
+        online_matched += 1;
+
+        const ip = firstIpv4TailscaleIp(peer_value) orelse continue;
+        const created = stringField(peer_value, "Created") orelse "";
+        if (best_ip == null or std.mem.order(u8, created, best_created) == .gt) {
+            best_ip = ip;
+            best_created = created;
+        }
+    }
+
+    if (best_ip) |ip| return allocator.dupe(u8, ip);
+    if (online_matched > 0) return error.MatchingTailscalePeerMissingIpv4;
+    if (matched > 0) return error.NoOnlineTailscalePeer;
+    return error.NoMatchingTailscalePeer;
+}
+
+fn tailscalePeerMatchesHost(peer_value: std.json.Value, host: []const u8) bool {
+    if (stringField(peer_value, "HostName")) |hostname| {
+        if (std.mem.eql(u8, hostname, host)) return true;
+    }
+    if (stringField(peer_value, "DNSName")) |dns_name| {
+        return dnsNameMatchesHost(dns_name, host);
+    }
+    return false;
+}
+
+fn dnsNameMatchesHost(dns_name: []const u8, host: []const u8) bool {
+    if (!std.mem.startsWith(u8, dns_name, host)) return false;
+    if (dns_name.len == host.len) return true;
+    return dns_name[host.len] == '.';
+}
+
+fn firstIpv4TailscaleIp(peer_value: std.json.Value) ?[]const u8 {
+    const ips_value = peer_value.object.get("TailscaleIPs") orelse return null;
+    if (ips_value != .array) return null;
+    for (ips_value.array.items) |ip_value| {
+        if (ip_value != .string) continue;
+        _ = std.net.Address.parseIp4(ip_value.string, 0) catch continue;
+        return ip_value.string;
+    }
+    return null;
+}
+
+fn stringField(value: std.json.Value, key: []const u8) ?[]const u8 {
+    if (value != .object) return null;
+    const field = value.object.get(key) orelse return null;
+    return switch (field) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn boolField(value: std.json.Value, key: []const u8) ?bool {
+    if (value != .object) return null;
+    const field = value.object.get(key) orelse return null;
+    return switch (field) {
+        .bool => |flag| flag,
+        else => null,
+    };
 }
 
 fn parseTailscaleIpv4Output(
@@ -751,6 +859,56 @@ test "reject empty and malformed tailscale resolver output" {
     try std.testing.expectError(error.SshResolutionFailed, parseTailscaleIpv4Output(allocator, "\n"));
     try std.testing.expectError(error.SshResolutionFailed, parseTailscaleIpv4Output(allocator, "not-an-ip\n"));
     try std.testing.expectError(error.SshResolutionFailed, parseTailscaleIpv4Output(allocator, "100.64.1.2\n100.64.1.3\n"));
+}
+
+test "tailscale status resolver prefers newest online duplicate hostname" {
+    const allocator = std.testing.allocator;
+    const ip = try resolveTailscaleHostFromStatus(allocator, "mesh-mesh-demo-a",
+        \\{
+        \\  "Peer": {
+        \\    "old": {
+        \\      "HostName": "mesh-mesh-demo-a",
+        \\      "DNSName": "mesh-mesh-demo-a.tailnet.ts.net.",
+        \\      "Online": false,
+        \\      "Created": "2026-06-26T14:49:49Z",
+        \\      "TailscaleIPs": ["100.111.145.3", "fd7a:115c:a1e0::1"]
+        \\    },
+        \\    "middle": {
+        \\      "HostName": "mesh-mesh-demo-a",
+        \\      "DNSName": "mesh-mesh-demo-a-1.tailnet.ts.net.",
+        \\      "Online": true,
+        \\      "Created": "2026-06-26T15:02:54Z",
+        \\      "TailscaleIPs": ["100.94.84.59"]
+        \\    },
+        \\    "new": {
+        \\      "HostName": "mesh-mesh-demo-a",
+        \\      "DNSName": "mesh-mesh-demo-a-2.tailnet.ts.net.",
+        \\      "Online": true,
+        \\      "Created": "2026-06-26T15:24:51Z",
+        \\      "TailscaleIPs": ["100.101.236.39"]
+        \\    }
+        \\  }
+        \\}
+    );
+    defer allocator.free(ip);
+
+    try std.testing.expectEqualStrings("100.101.236.39", ip);
+}
+
+test "tailscale status resolver refuses offline stale duplicate hostnames" {
+    try std.testing.expectError(error.NoOnlineTailscalePeer, resolveTailscaleHostFromStatus(std.testing.allocator, "mesh-mesh-demo-a",
+        \\{
+        \\  "Peer": {
+        \\    "old": {
+        \\      "HostName": "mesh-mesh-demo-a",
+        \\      "DNSName": "mesh-mesh-demo-a.tailnet.ts.net.",
+        \\      "Online": false,
+        \\      "Created": "2026-06-26T14:49:49Z",
+        \\      "TailscaleIPs": ["100.111.145.3"]
+        \\    }
+        \\  }
+        \\}
+    ));
 }
 
 test "tailscale resolver records configured and resolved hosts" {
