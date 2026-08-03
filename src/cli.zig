@@ -2033,25 +2033,26 @@ test "parse down with json" {
     }
 }
 
-test "parse exec command" {
-    const command = try parse(&.{ "exec", "work", "--", "uname", "-a" });
+test "parse and render exec multiline script" {
+    const allocator = std.testing.allocator;
+    const script =
+        \\echo first
+        \\echo second
+    ;
+    const command = try parse(&.{ "exec", "work", "--", "sh", "-lc", script });
 
     switch (command) {
         .exec => |exec_command| {
             try std.testing.expectEqualStrings("work", exec_command.machine_name);
-            try std.testing.expectEqual(@as(usize, 2), exec_command.argv.len);
-            try std.testing.expectEqualStrings("uname", exec_command.argv[0]);
+            const expected = try std.fmt.allocPrint(allocator, "'sh' '-lc' '{s}'", .{script});
+            defer allocator.free(expected);
+            const rendered = try renderRemoteCommand(allocator, exec_command.argv);
+            defer allocator.free(rendered);
+
+            try std.testing.expectEqualStrings(expected, rendered);
         },
         else => return error.InvalidArguments,
     }
-}
-
-test "render remote command quotes argv" {
-    const allocator = std.testing.allocator;
-    const rendered = try renderRemoteCommand(allocator, &.{ "sh", "-lc", "echo hello && pwd" });
-    defer allocator.free(rendered);
-
-    try std.testing.expectEqualStrings("'sh' '-lc' 'echo hello && pwd'", rendered);
 }
 
 test "render launch progress event json line" {

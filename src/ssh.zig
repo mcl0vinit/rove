@@ -1172,6 +1172,52 @@ test "wrapped remote command preserves shell quoting" {
     try std.testing.expectEqualStrings(expected, wrapped);
 }
 
+test "batch command preserves multiline script exit zero" {
+    const allocator = std.testing.allocator;
+    const script =
+        \\set -eu
+        \\set +e
+        \\true
+        \\ledger_status=$?
+        \\set -e
+        \\printf "ledger_exit=%s\n" "$ledger_status"
+        \\printf "final_status=clean\n"
+        \\exit "$ledger_status"
+    ;
+    const remote_command = try std.fmt.allocPrint(allocator, "'sh' '-lc' '{s}'", .{script});
+    defer allocator.free(remote_command);
+    const machine = model.MachineRecord{
+        .name = "work",
+        .provider = .fly,
+        .id = "machine-id",
+        .host = "example.invalid",
+        .ssh_user = "rove",
+        .status = .ready,
+    };
+    const LocalRemoteRunner = struct {
+        fn run(
+            runner_allocator: std.mem.Allocator,
+            argv: []const []const u8,
+        ) anyerror!exec.Result {
+            try std.testing.expectEqualStrings("ssh", argv[0]);
+            return exec.run(runner_allocator, &.{ "/bin/sh", "-c", argv[argv.len - 1] });
+        }
+    };
+
+    const result = try runBatchCommandWithRecoveryAndRunner(
+        allocator,
+        machine,
+        remote_command,
+        .{ .allow_host_key_recovery = false },
+        LocalRemoteRunner.run,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.succeeded());
+    try std.testing.expectEqualStrings("ledger_exit=0\nfinal_status=clean\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
 fn fakeTailscaleSuccess(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
