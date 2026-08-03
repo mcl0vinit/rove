@@ -2036,14 +2036,8 @@ test "parse down with json" {
 test "parse and render exec multiline script" {
     const allocator = std.testing.allocator;
     const script =
-        \\set -eu
-        \\set +e
-        \\true
-        \\ledger_status=$?
-        \\set -e
-        \\printf "ledger_exit=%s\n" "$ledger_status"
-        \\printf "final_status=clean\n"
-        \\exit "$ledger_status"
+        \\echo first
+        \\echo second
     ;
     const command = try parse(&.{ "exec", "work", "--", "sh", "-lc", script });
 
